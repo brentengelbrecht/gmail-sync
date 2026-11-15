@@ -10,8 +10,9 @@ The local repository is authoritative. Gmail is only an import source:
 - later Gmail deletions never delete local data;
 - locally deleted Gmail messages are suppressed by a tombstone.
 
-Authentication uses a Google Workspace service account with domain-wide
-delegation. It is designed to run headlessly on a Linux host.
+Authentication supports both Google Workspace service accounts with domain-wide
+delegation and personal Gmail OAuth 2.0. Personal OAuth is authorised on a
+computer with a browser; its token is then transferred to the headless Pi.
 
 Configuration is supplied through environment variables. Run with --help for
 the required variables and usage information.
@@ -20,20 +21,26 @@ the required variables and usage information.
 from __future__ import annotations
 
 import argparse
+import errno
 import base64
 import hashlib
 import json
 import logging
 import os
 import sqlite3
+import shutil
+import random
+import time
 import stat
 import sys
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
+from requests import Session
 
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
@@ -49,27 +56,292 @@ REPOSITORY_MARKER = "repository.json"
 DATABASE_FILENAME = "repository.db"
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 API_PAGE_SIZE = 500
+DEFAULT_MIN_FREE_BYTES = 64 * 1024 * 1024
+MAX_API_RETRIES = 8
+DEFAULT_HTTP_TIMEOUT_SECONDS = 30
+INITIAL_BACKOFF_SECONDS = 2.0
+MAX_BACKOFF_SECONDS = 120.0
+# Keep request volume below bursty per-user limits. The interval adapts upward
+# after quota responses and gradually recovers after sustained success.
+INITIAL_API_REQUEST_INTERVAL_SECONDS = 0.25
+MIN_API_REQUEST_INTERVAL_SECONDS = 0.15
+MAX_API_REQUEST_INTERVAL_SECONDS = 5.0
+API_INTERVAL_RECOVERY_SUCCESSES = 40
+
+
+class TimeoutSession(Session):
+    """Requests session that applies a finite timeout to every HTTP request."""
+
+    def request(self, method, url, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = DEFAULT_HTTP_TIMEOUT_SECONDS
+
+        return super().request(method, url, **kwargs)
+
+
+class DiskSpaceExhausted(RuntimeError):
+    """Fatal repository storage condition; stop the import immediately."""
+
+
+class GmailRateLimitExhausted(RuntimeError):
+    """Gmail continued rejecting requests after bounded exponential backoff."""
+
+
+# The importer is single-threaded, so a small module-level pacing state is
+# sufficient. It applies across all Gmail API operations in this process.
+_api_request_interval = INITIAL_API_REQUEST_INTERVAL_SECONDS
+_api_last_request_started = 0.0
+_api_successes_at_current_interval = 0
+
+
+def interruptible_wait(seconds: float) -> None:
+    """Wait without masking Ctrl-C; check in short intervals as a safeguard."""
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        # time.sleep in the main thread is interrupted by SIGINT. Short slices
+        # also ensure the loop never commits to one long, opaque wait.
+        time.sleep(min(0.25, remaining))
+
+
+def pace_google_request() -> None:
+    """Wait until the adaptive minimum interval has elapsed."""
+    global _api_last_request_started
+    now = time.monotonic()
+    elapsed = now - _api_last_request_started
+    wait = _api_request_interval - elapsed
+    if wait > 0:
+        interruptible_wait(wait)
+    _api_last_request_started = time.monotonic()
+
+
+def note_google_request_success() -> None:
+    """Gradually recover request speed after sustained successful calls."""
+    global _api_request_interval, _api_successes_at_current_interval
+    _api_successes_at_current_interval += 1
+    if _api_successes_at_current_interval >= API_INTERVAL_RECOVERY_SUCCESSES:
+        _api_request_interval = max(
+            MIN_API_REQUEST_INTERVAL_SECONDS,
+            _api_request_interval * 0.9,
+        )
+        _api_successes_at_current_interval = 0
+
+
+def note_google_rate_limit() -> None:
+    """Back off proactively after a quota response, not just for one retry."""
+    global _api_request_interval, _api_successes_at_current_interval
+    _api_request_interval = min(
+        MAX_API_REQUEST_INTERVAL_SECONDS,
+        max(INITIAL_API_REQUEST_INTERVAL_SECONDS, _api_request_interval * 2),
+    )
+    _api_successes_at_current_interval = 0
+
+
+def server_retry_delay(exc: HttpError) -> Optional[float]:
+    """Extract Retry-After or Google RPC RetryInfo delay, if supplied."""
+    response = getattr(exc, "resp", None)
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = None
+    try:
+        retry_after = next(
+            (value for key, value in headers.items()
+             if str(key).casefold() == "retry-after"),
+            None,
+        )
+    except AttributeError:
+        pass
+
+    if retry_after is not None:
+        try:
+            return max(0.0, float(retry_after))
+        except (TypeError, ValueError):
+            try:
+                retry_date = parsedate_to_datetime(str(retry_after))
+                if retry_date.tzinfo is None:
+                    retry_date = retry_date.replace(tzinfo=timezone.utc)
+                return max(0.0, (retry_date - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+    try:
+        payload = json.loads(exc.content.decode("utf-8"))
+        details = payload.get("error", {}).get("details", [])
+        for detail in details:
+            value = detail.get("retryDelay") or detail.get("retry_delay")
+            if value is None:
+                continue
+            # Google RPC Duration values are strings such as "1.500s".
+            text_value = str(value).strip()
+            if text_value.endswith("s"):
+                return max(0.0, float(text_value[:-1]))
+            return max(0.0, float(text_value))
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def execute_google_request(request, description: str):
+    """Execute a Gmail API request with adaptive pacing and retry handling.
+
+    Quota responses increase the delay between all subsequent API calls. A
+    server-provided retry delay is honoured when present; otherwise bounded
+    exponential backoff with jitter is used. Non-quota 403s are not retried.
+    """
+    for attempt in range(MAX_API_RETRIES + 1):
+        pace_google_request()
+        try:
+            result = request.execute()
+            note_google_request_success()
+            return result
+        except HttpError as exc:
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            reason = ""
+            try:
+                payload = json.loads(exc.content.decode("utf-8"))
+                errors = payload.get("error", {}).get("errors", [])
+                reason = errors[0].get("reason", "") if errors else ""
+            except Exception:
+                pass
+            retryable = (
+                status == 429
+                or (status == 403 and reason in {
+                    "rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"
+                })
+                or (status is not None and 500 <= status < 600)
+            )
+            if not retryable:
+                raise
+
+            is_quota_rejection = (
+                status == 429
+                or (status == 403 and reason in {
+                    "rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"
+                })
+            )
+            if is_quota_rejection:
+                note_google_rate_limit()
+            if attempt >= MAX_API_RETRIES:
+                raise GmailRateLimitExhausted(
+                    f"Gmail API kept rejecting {description} after "
+                    f"{MAX_API_RETRIES + 1} attempts (HTTP {status}, "
+                    f"reason {reason or 'unknown'}). The import has stopped; "
+                    "run it again later to resume."
+                ) from exc
+
+            suggested_delay = server_retry_delay(exc)
+            if suggested_delay is not None:
+                delay = suggested_delay
+                delay_source = "Gmail Retry-After/retry-delay"
+            else:
+                delay = min(
+                    MAX_BACKOFF_SECONDS,
+                    INITIAL_BACKOFF_SECONDS * (2 ** attempt),
+                )
+                delay *= random.uniform(0.8, 1.2)
+                delay_source = "local exponential backoff"
+
+            logging.warning(
+                "Gmail API rate limit/transient error for %s "
+                "(HTTP %s, %s); retry %s/%s in %.1f seconds (%s). "
+                "Adaptive request interval is now %.2f seconds.",
+                description, status, reason or "transient error",
+                attempt + 1, MAX_API_RETRIES, delay, delay_source,
+                _api_request_interval,
+            )
+            interruptible_wait(delay)
+
+
+def minimum_free_bytes() -> int:
+    raw = os.environ.get("GMAIL_MIN_FREE_BYTES", str(DEFAULT_MIN_FREE_BYTES))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("GMAIL_MIN_FREE_BYTES must be a non-negative integer.") from exc
+    if value < 0:
+        raise ValueError("GMAIL_MIN_FREE_BYTES must be a non-negative integer.")
+    return value
+
+
+def check_disk_space(path: Path) -> None:
+    """Keep a configurable free-space reserve before writing more data."""
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    usage = shutil.disk_usage(probe)
+    reserve = minimum_free_bytes()
+    if usage.free < reserve:
+        raise DiskSpaceExhausted(
+            f"Insufficient disk space at {probe}: {usage.free:,} bytes free; "
+            f"the configured safety reserve is {reserve:,} bytes. "
+            "The import has stopped. Free space and run it again to resume. "
+            "Set GMAIL_MIN_FREE_BYTES=0 to disable the reserve check."
+        )
+
+
+def is_disk_full_error(exc: BaseException) -> bool:
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return True
+    if isinstance(exc, sqlite3.Error):
+        return getattr(exc, "sqlite_errorcode", None) == getattr(sqlite3, "SQLITE_FULL", 13)
+    return False
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=Path(sys.argv[0]).name,
         description=(
-            "Import Gmail messages into an authoritative local repository. "
-            "The first run creates a repository; later runs import previously "
-            "unseen messages without overwriting local organisation."
+            "Import Gmail messages into an authoritative local repository, or "
+            "authorise a personal Gmail account on a computer with a browser."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""\
-Environment variables:
-  GOOGLE_SERVICE_ACCOUNT_FILE  Path to the Workspace service-account JSON key
-                               (required)
-  GMAIL_IMPERSONATE_USER       Workspace mailbox address to import (required)
+AUTHENTICATION FLOWS
+
+1. Google Workspace (existing flow; unchanged):
+   GOOGLE_SERVICE_ACCOUNT_FILE and GMAIL_IMPERSONATE_USER identify the
+   service-account key and Workspace mailbox. The service account must have
+   domain-wide delegation enabled and the exact scope below authorised by the
+   Workspace administrator.
+
+2. Personal Gmail (one-time browser authorisation on a computer):
+   Run --authorise on a Mac/PC/Linux computer with a browser. Supply the
+   Desktop OAuth client JSON and the Gmail address. The command writes a
+   refreshable token file. Transfer that token securely to the Raspberry Pi.
+   The Pi then runs normal imports headlessly.
+
+   {Path(sys.argv[0]).name} --authorise --account you@gmail.com \
+       --oauth-client-file ~/Downloads/oauth-client.json \
+       --output ~/gmail-token.json
+
+   On the Pi, set GMAIL_OAUTH_TOKEN_FILE to the transferred token and
+   GMAIL_ACCOUNT to the same Gmail address. No browser is needed on the Pi.
+
+COMMON SETTINGS
   DB_LOCATION                  Parent directory for repositories
                                (optional; default: {DEFAULT_DB_LOCATION})
+  GMAIL_MIN_FREE_BYTES         Minimum free-space reserve (optional;
+                               default: {DEFAULT_MIN_FREE_BYTES}; set 0 to disable)
+  GMAIL_AUTH_METHOD            workspace or oauth; optional when the
+                               credentials clearly identify one method
 
-The service account must have Workspace domain-wide delegation enabled and
-must be authorised for this exact scope:
+WORKSPACE SETTINGS
+  GOOGLE_SERVICE_ACCOUNT_FILE  Workspace service-account JSON key
+  GMAIL_IMPERSONATE_USER       Workspace mailbox address
+
+PERSONAL GMAIL SETTINGS
+  GMAIL_ACCOUNT                Personal Gmail address
+  GMAIL_OAUTH_TOKEN_FILE       OAuth token JSON (transferred from authorising
+                               computer)
+
+OAuth authorisation options:
+  --authorise                  Perform personal Gmail OAuth authorisation
+  --account                    Gmail address to authorise
+  --oauth-client-file          Google OAuth Desktop client JSON
+  --output                     Token output path (owner-only permissions)
+
+OAuth scope (read-only):
   {GMAIL_READONLY_SCOPE}
 
 The repository is created at:
@@ -79,9 +351,16 @@ It contains {DATABASE_FILENAME}, {REPOSITORY_MARKER}, and a messages/
 directory. Each messages shard contains no more than
 {MAX_FILES_PER_SHARD} RFC822 files.
 
-Examples:
+Examples for Workspace imports (same configuration as previous versions):
   export GOOGLE_SERVICE_ACCOUNT_FILE="$HOME/.config/gmail-local-repository/service-account.json"
   export GMAIL_IMPERSONATE_USER="you@yourdomain.com"
+  export DB_LOCATION="./data"
+  {Path(sys.argv[0]).name}
+
+Examples for personal Gmail imports on the Pi:
+  export GMAIL_AUTH_METHOD="oauth"
+  export GMAIL_ACCOUNT="you@gmail.com"
+  export GMAIL_OAUTH_TOKEN_FILE="$HOME/.config/gmail-local-repository/personal-gmail-token.json"
   export DB_LOCATION="./data"
   {Path(sys.argv[0]).name}
 
@@ -92,7 +371,28 @@ Import behaviour:
   - Gmail deletions and label removals do not delete local messages.
   - Gmail label changes are recorded separately from local folder membership.
   - Local deletion tombstones suppress future re-imports.
+  - Gmail API requests are paced adaptively; quota failures slow subsequent calls.
+  - Retry-After / Google retry-delay hints are honoured when supplied; otherwise
+    bounded exponential backoff with jitter is used.
+  - Ctrl-C interrupts request pacing and retry waits; Gmail HTTP operations
+    also have a 30-second timeout. The importer exits with status 130 after
+    closing the local database.
+  - Disk-space reserve is checked before import writes; disk-full errors stop
+    the run immediately and preserve previously completed messages.
 """,
+    )
+    parser.add_argument(
+        "--authorise", action="store_true",
+        help="authorise a personal Gmail account (run on a computer with a browser)",
+    )
+    parser.add_argument("--account", help="personal Gmail address to authorise")
+    parser.add_argument(
+        "--oauth-client-file", type=Path,
+        help="Google OAuth Desktop client JSON downloaded from Google Cloud",
+    )
+    parser.add_argument(
+        "--output", type=Path,
+        help="where to save the personal Gmail OAuth token JSON",
     )
     return parser
 
@@ -109,21 +409,49 @@ def safe_repository_name(username: str) -> str:
 
 
 def get_configuration() -> dict:
-    mailbox = required_environment("GMAIL_IMPERSONATE_USER")
-    key_file = Path(
-        required_environment("GOOGLE_SERVICE_ACCOUNT_FILE")
-    ).expanduser()
+    auth_method = os.environ.get("GMAIL_AUTH_METHOD", "").strip().casefold()
+    workspace_mailbox = os.environ.get("GMAIL_IMPERSONATE_USER", "").strip()
+    personal_mailbox = os.environ.get("GMAIL_ACCOUNT", "").strip()
+    service_account_value = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+    oauth_token_value = os.environ.get("GMAIL_OAUTH_TOKEN_FILE", "").strip()
+
+    if not auth_method:
+        if service_account_value and workspace_mailbox:
+            auth_method = "workspace"
+        elif oauth_token_value and (personal_mailbox or workspace_mailbox):
+            auth_method = "oauth"
+        else:
+            raise ValueError(
+                "Cannot determine Gmail authentication method. Set "
+                "GMAIL_AUTH_METHOD=workspace or oauth and configure the "
+                "corresponding environment variables."
+            )
+
+    if auth_method not in ("workspace", "oauth"):
+        raise ValueError("GMAIL_AUTH_METHOD must be 'workspace' or 'oauth'.")
+    mailbox = workspace_mailbox if auth_method == "workspace" else (personal_mailbox or workspace_mailbox)
+    if not mailbox:
+        raise ValueError("Set GMAIL_IMPERSONATE_USER (Workspace) or GMAIL_ACCOUNT (OAuth).")
+
     db_location = Path(
         os.environ.get("DB_LOCATION", DEFAULT_DB_LOCATION)
     ).expanduser()
-    repository_path = db_location / safe_repository_name(mailbox)
-    return {
+    config = {
+        "auth_method": auth_method,
         "mailbox": mailbox,
-        "service_account_file": key_file,
         "db_location": db_location,
-        "repository_path": repository_path,
-        "database_path": repository_path / DATABASE_FILENAME,
+        "repository_path": db_location / safe_repository_name(mailbox),
     }
+    config["database_path"] = config["repository_path"] / DATABASE_FILENAME
+    if auth_method == "workspace":
+        if not service_account_value:
+            raise ValueError("GOOGLE_SERVICE_ACCOUNT_FILE is required for Workspace authentication.")
+        config["service_account_file"] = Path(service_account_value).expanduser()
+    else:
+        if not oauth_token_value:
+            raise ValueError("GMAIL_OAUTH_TOKEN_FILE is required for personal Gmail OAuth.")
+        config["oauth_token_file"] = Path(oauth_token_value).expanduser()
+    return config
 
 
 def detect_repository_mode(repository_path: Path) -> str:
@@ -205,7 +533,7 @@ def transaction(connection: sqlite3.Connection):
         connection.execute("BEGIN IMMEDIATE")
         yield
         connection.commit()
-    except Exception:
+    except BaseException:
         connection.rollback()
         raise
 
@@ -367,7 +695,7 @@ def ensure_repository(connection: sqlite3.Connection, repository_path: Path,
     ).fetchone()
     if row is None or row["value"].casefold() != mailbox.casefold():
         raise RuntimeError(
-            "The repository database does not match GMAIL_IMPERSONATE_USER."
+            "The repository database does not match the configured Gmail account."
         )
 
     required_tables = {
@@ -396,37 +724,67 @@ def ensure_repository(connection: sqlite3.Connection, repository_path: Path,
         write_repository_marker(repository_path, mailbox)
 
 
-def connect_gmail_api(service_account_file: Path, mailbox: str):
-    if not service_account_file.is_file():
-        raise RuntimeError(
-            f"Service-account JSON key file not found: {service_account_file}"
-        )
-
+def _warn_if_permissive_permissions(path: Path, description: str) -> None:
     try:
-        mode = stat.S_IMODE(service_account_file.stat().st_mode)
+        mode = stat.S_IMODE(path.stat().st_mode)
         if mode & 0o077:
             logging.warning(
-                "Service-account key permissions are broader than owner-only. "
-                "Consider: chmod 600 %s",
-                service_account_file,
+                "%s permissions are broader than owner-only. Consider: chmod 600 %s",
+                description, path,
             )
     except OSError:
-        logging.debug("Could not inspect service-account key permissions.")
+        logging.debug("Could not inspect %s permissions.", description)
 
+
+def connect_gmail_api_workspace(service_account_file: Path, mailbox: str):
+    if not service_account_file.is_file():
+        raise RuntimeError(f"Service-account JSON key file not found: {service_account_file}")
+    _warn_if_permissive_permissions(service_account_file, "Service-account key")
     credentials = service_account.Credentials.from_service_account_file(
-        str(service_account_file),
-        scopes=[GMAIL_READONLY_SCOPE],
-        subject=mailbox,
+        str(service_account_file), scopes=[GMAIL_READONLY_SCOPE], subject=mailbox,
     )
-    credentials.refresh(Request())
+    credentials.refresh(Request(session=TimeoutSession()))
+    return _build_and_verify_gmail_service(credentials, mailbox)
 
-    service = build(
-        "gmail",
-        "v1",
-        credentials=credentials,
-        cache_discovery=False,
+
+def connect_gmail_api_oauth(token_file: Path, mailbox: str):
+    if not token_file.is_file():
+        raise RuntimeError(
+            f"OAuth token file not found: {token_file}. Run --authorise on a "
+            "computer with a browser, then transfer the token to this machine."
+        )
+    _warn_if_permissive_permissions(token_file, "OAuth token")
+    from google.oauth2.credentials import Credentials
+    credentials = Credentials.from_authorized_user_file(
+        str(token_file), scopes=[GMAIL_READONLY_SCOPE]
     )
-    profile = service.users().getProfile(userId="me").execute()
+    if not credentials.valid:
+        if credentials.expired and credentials.refresh_token:
+            credentials.refresh(Request(session=TimeoutSession()))
+            # Persist a rotated/refreshed token where possible.
+            atomic_write_private_text(token_file, credentials.to_json())
+        else:
+            raise RuntimeError(
+                "The personal Gmail OAuth token is invalid or has no refresh "
+                "token. Re-run --authorise on a computer with a browser and "
+                "transfer the new token to the Pi."
+            )
+    return _build_and_verify_gmail_service(credentials, mailbox)
+
+
+def _build_and_verify_gmail_service(credentials, mailbox: str):
+    # The discovery client's default HTTP transport can have no socket timeout.
+    # Bound network waits so a stalled connection cannot hang the importer
+    # indefinitely; SIGINT remains able to interrupt the active request.
+    import httplib2
+    from google_auth_httplib2 import AuthorizedHttp
+
+    http = AuthorizedHttp(
+        credentials,
+        http=httplib2.Http(timeout=DEFAULT_HTTP_TIMEOUT_SECONDS),
+    )
+    service = build("gmail", "v1", http=http, cache_discovery=False)
+    profile = execute_google_request(service.users().getProfile(userId="me"), "Gmail profile lookup")
     returned_mailbox = profile.get("emailAddress", "")
     if returned_mailbox.casefold() != mailbox.casefold():
         raise RuntimeError(
@@ -435,14 +793,83 @@ def connect_gmail_api(service_account_file: Path, mailbox: str):
         )
     logging.info(
         "Authenticated to Gmail API as %s (%s messages reported).",
-        returned_mailbox,
-        f"{profile.get('messagesTotal', 0):,}",
+        returned_mailbox, f"{profile.get('messagesTotal', 0):,}",
     )
     return service
 
 
+def atomic_write_private_text(path: Path, contents: str) -> None:
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def authorise_personal_gmail(account: str, oauth_client_file: Path, output_file: Path) -> int:
+    if not account or "@" not in account:
+        raise ValueError("--account must be a full Gmail address.")
+    oauth_client_file = oauth_client_file.expanduser()
+    if not oauth_client_file.is_file():
+        raise RuntimeError(f"OAuth Desktop client JSON not found: {oauth_client_file}")
+    _warn_if_permissive_permissions(oauth_client_file, "OAuth client configuration")
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError as exc:
+        raise RuntimeError(
+            "Personal Gmail authorisation requires google-auth-oauthlib. Install "
+            "it with: python -m pip install --upgrade google-auth-oauthlib"
+        ) from exc
+
+    flow = InstalledAppFlow.from_client_secrets_file(
+        str(oauth_client_file), scopes=[GMAIL_READONLY_SCOPE],
+        autogenerate_code_verifier=True,
+    )
+    credentials = flow.run_local_server(
+        host="127.0.0.1", port=0, open_browser=True,
+        authorization_prompt_message="Open this URL to authorise Gmail: {url}",
+        success_message="Gmail authorisation completed. You may close this browser tab.",
+        access_type="offline", prompt="consent",
+    )
+    if not credentials.refresh_token:
+        raise RuntimeError(
+            "Google did not return a refresh token. Revoke this app's existing "
+            "grant in your Google Account and run --authorise again."
+        )
+    credentials.refresh(Request(session=TimeoutSession()))
+    _build_and_verify_gmail_service(credentials, account)
+    atomic_write_private_text(output_file, credentials.to_json())
+    print(f"Authorisation successful for {account}.")
+    print(f"Token saved to: {output_file.expanduser()}")
+    print("Transfer this token securely to the Raspberry Pi; do not email or publish it.")
+    return 0
+
+
+def connect_gmail_api(config: dict):
+    if config["auth_method"] == "workspace":
+        return connect_gmail_api_workspace(config["service_account_file"], config["mailbox"])
+    return connect_gmail_api_oauth(config["oauth_token_file"], config["mailbox"])
+
+
 def list_gmail_labels(service) -> list[dict]:
-    response = service.users().labels().list(userId="me").execute()
+    response = execute_google_request(service.users().labels().list(userId="me"), "Gmail label listing")
     labels = response.get("labels", [])
     return sorted(labels, key=lambda item: item.get("name", "").casefold())
 
@@ -532,7 +959,7 @@ def list_gmail_message_ids(service):
         }
         if page_token:
             kwargs["pageToken"] = page_token
-        response = service.users().messages().list(**kwargs).execute()
+        response = execute_google_request(service.users().messages().list(**kwargs), "Gmail message listing page")
         for item in response.get("messages", []):
             message_id = item.get("id")
             if message_id:
@@ -549,9 +976,12 @@ def fetch_gmail_message(service, gm_id: str, include_raw: bool) -> dict:
     repeated downloads of their potentially large message bodies.
     """
     response_format = "raw" if include_raw else "metadata"
-    message = service.users().messages().get(
-        userId="me", id=gm_id, format=response_format
-    ).execute()
+    message = execute_google_request(
+        service.users().messages().get(
+            userId="me", id=gm_id, format=response_format
+        ),
+        f"Gmail message {gm_id} ({response_format})",
+    )
 
     raw_message = None
     if include_raw:
@@ -690,6 +1120,7 @@ def import_one_message(connection: sqlite3.Connection, repository_path: Path,
             f"Refusing to overwrite unexpected existing message file: {final_path}"
         )
 
+    check_disk_space(repository_path)
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{gm_id}.", suffix=".tmp", dir=shard_path
     )
@@ -743,11 +1174,18 @@ def import_one_message(connection: sqlite3.Connection, repository_path: Path,
                     """,
                     (shard_id,),
                 )
-        except Exception:
+        except BaseException:
             final_path.unlink(missing_ok=True)
             raise
-    except Exception:
+    except BaseException as exc:
         temporary_path.unlink(missing_ok=True)
+        if is_disk_full_error(exc):
+            raise DiskSpaceExhausted(
+                "The filesystem ran out of space while saving a message or "
+                "updating SQLite. The current message was not committed; "
+                "successfully completed earlier messages remain in the repository. "
+                "Free space and run the importer again to resume."
+            ) from exc
         raise
 
     return True
@@ -767,7 +1205,9 @@ def sync_gmail(connection: sqlite3.Connection, service,
     # so show the live checked/imported/failed counts without a percentage.
     progress_line = ""
     try:
+        check_disk_space(repository_path)
         for gm_id in list_gmail_message_ids(service):
+            check_disk_space(repository_path)
             total_seen += 1
             try:
                 tombstone = connection.execute(
@@ -784,12 +1224,20 @@ def sync_gmail(connection: sqlite3.Connection, service,
                         connection, repository_path, message, label_mapping, mode
                     ):
                         total_imported += 1
+            except (DiskSpaceExhausted, GmailRateLimitExhausted):
+                raise
             except HttpError as exc:
                 total_failed += 1
                 logging.error(
                     "Gmail API failed retrieving message %s: %s", gm_id, exc
                 )
-            except Exception:
+            except Exception as exc:
+                if is_disk_full_error(exc):
+                    raise DiskSpaceExhausted(
+                        "The filesystem ran out of space during import. "
+                        "The current message was not committed; earlier completed "
+                        "messages remain available. Free space and rerun to resume."
+                    ) from exc
                 total_failed += 1
                 logging.exception("Failed importing Gmail message %s", gm_id)
 
@@ -994,10 +1442,17 @@ def verify_repository_files(connection: sqlite3.Connection,
 
 def main() -> int:
     parser = build_argument_parser()
-    parser.parse_args()  # --help works without requiring environment variables.
+    args = parser.parse_args()  # --help works without requiring environment variables.
 
     connection = None
     try:
+        if args.authorise:
+            if not args.account or not args.oauth_client_file or not args.output:
+                parser.error("--authorise requires --account, --oauth-client-file and --output")
+            return authorise_personal_gmail(args.account, args.oauth_client_file, args.output)
+        if args.account or args.oauth_client_file or args.output:
+            parser.error("--account, --oauth-client-file and --output are only used with --authorise")
+
         config = get_configuration()
         repository_path = config["repository_path"]
         mode = detect_repository_mode(repository_path)
@@ -1005,9 +1460,7 @@ def main() -> int:
         # Authenticate and retrieve the label catalogue before creating a new
         # repository. A failed Google setup therefore leaves no half-created
         # repository that could be mistaken for an established incremental sync.
-        service = connect_gmail_api(
-            config["service_account_file"], config["mailbox"]
-        )
+        service = connect_gmail_api(config)
         labels = list_gmail_labels(service)
 
         repository_path.mkdir(parents=True, exist_ok=True)
@@ -1024,6 +1477,7 @@ def main() -> int:
         )
         logging.info("Repository: %s", repository_path)
 
+        check_disk_space(repository_path)
         total_imported, total_failed = sync_gmail(
             connection, service, repository_path, mode, labels
         )
@@ -1034,11 +1488,32 @@ def main() -> int:
         )
         return 1 if total_failed else 0
 
+    except KeyboardInterrupt:
+        logging.warning(
+            "Interrupted by user (Ctrl-C). The importer is stopping; "
+            "completed messages remain saved and the next run can resume."
+        )
+        return 130
+    except GmailRateLimitExhausted as exc:
+        logging.error("%s", exc)
+        return 3
+    except DiskSpaceExhausted as exc:
+        logging.error("DISK SPACE: %s", exc)
+        return 4
     except HttpError as exc:
         logging.error("Google API error: %s", exc)
         return 2
     except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
+        if is_disk_full_error(exc):
+            logging.error(
+                "DISK SPACE: the filesystem could not complete a write. "
+                "The importer has stopped. Free space and run it again to resume."
+            )
+            return 4
         logging.error("%s", exc)
+        return 2
+    except Exception as exc:
+        logging.error("Authentication or importer failure (%s): %s", type(exc).__name__, exc)
         return 2
     finally:
         if connection is not None:

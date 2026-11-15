@@ -1,580 +1,410 @@
-# imap_sync
-
-The original script using Gmail's SMTP interface to extract emails to the local 
-file system. 
-
 # Gmail Local Repository Importer
 
-Supercedes `imap_sync.py`.
+A one-way Gmail-to-local repository importer. Gmail is the acquisition source; the local repository is intended to remain usable independently of Gmail.
 
-A headless Python importer for copying a Google Workspace Gmail mailbox into a
-local, SQLite-indexed repository. It is designed to run on Linux.
+This version supports two ways to authenticate to the Gmail API:
 
-The guiding principle is that **Gmail is an acquisition source; the local
-repository is authoritative after import**. The importer moves data in one
-direction only: Gmail → local repository. It does not write messages, labels,
-or other changes back to Gmail.
+- **Google Workspace:** service account with domain-wide delegation. This is the existing Raspberry Pi/headless flow and remains supported.
+- **Personal Gmail (`@gmail.com`):** OAuth 2.0 Desktop authorisation performed once on a computer with a browser. The resulting token is transferred to the Raspberry Pi; normal imports then run headlessly.
 
-> **Status:** This is an early implementation. The authentication setup has
-> been tested successfully against the Workspace account, and the repository
-> database/file routines have had local tests. Keep Gmail and 
-> separate backups until you have verified your imported repository.
+Both authentication methods use the same Gmail API extraction and repository code. No App Password or IMAP authentication is used.
 
-## Contents
+## 1. What the importer does
 
-- [Features](#features)
-- [How it works](#how-it-works)
-- [Requirements](#requirements)
-- [Google Workspace and OAuth setup](#google-workspace-and-oauth-setup)
-- [Install](#install)
-- [Configuration](#configuration)
-- [Run the importer](#run-the-importer)
-- [Progress and logging](#progress-and-logging)
-- [Repository layout](#repository-layout)
-- [Data model](#data-model)
-- [Initial import and incremental sync](#initial-import-and-incremental-sync)
-- [Data integrity and preservation](#data-integrity-and-preservation)
-- [Backups](#backups)
-- [Security](#security)
-- [Current limitations and planned work](#current-limitations-and-planned-work)
-- [Troubleshooting](#troubleshooting)
+- Creates a local repository on the first run and incrementally imports previously unseen Gmail messages on later runs.
+- Lists messages with `includeSpamTrash=True`, so Spam and Trash are included in the message scan.
+- Retrieves new messages in Gmail's `raw` format and stores the decoded RFC 2822/MIME bytes as message files. Attachments remain part of the MIME message.
+- Stores each Gmail message once, even when it has multiple Gmail labels.
+- Records Gmail labels separately from local folder memberships. Initial label memberships are copied locally; later Gmail label changes do not reorganise existing local folders.
+- Does not delete local messages when Gmail messages or labels disappear remotely.
+- Uses Gmail message IDs as the canonical remote identity, rather than relying on RFC 822 `Message-ID` headers.
+- Stores metadata in SQLite and message files in shards containing at most 500 messages each.
+- Stores file size and SHA-256 information and checks repository file integrity before an incremental sync.
+- Uses SQLite WAL mode and full synchronous writes.
+- Displays a single-line progress indicator during message scanning/import.
 
-## Features
+The importer does not write to Gmail. The OAuth scope is read-only: `https://www.googleapis.com/auth/gmail.readonly`.
 
-- **Headless Google Workspace authentication** using a service account with
-  domain-wide delegation. No browser sign-in is required bash cli.
-- **Read-only Gmail access** using the
-  `https://www.googleapis.com/auth/gmail.readonly` OAuth scope.
-- **Initial import and incremental sync.** The first run creates a repository
-  and imports messages; later runs scan Gmail for messages not already stored.
-- **Raw message storage.** New messages are retrieved using Gmail API
-  `format="raw"`, base64url-decoded, and written as binary `.eml` files. The
-  importer does not parse and reconstruct MIME messages or rewrite headers.
-- **One physical file per Gmail message.** A message carrying several Gmail
-  labels is stored once, not copied into multiple directories.
-- **Gmail labels tracked separately from local folders.** On the initial
-  import, Gmail labels are mapped to local folders. Later Gmail label changes
-  update the source-label snapshot but do not reorganise existing local folder
-  memberships.
-- **Local state is not overwritten by Gmail sync.** Existing local folder
-  memberships and local read/starred fields are not reset when a message is
-  encountered again.
-- **Remote deletions do not delete local data.** A message disappearing from
-  Gmail does not cause its local file or local folder memberships to be
-  removed.
-- **Tombstone support in the data model.** A locally deleted Gmail message ID
-  can be recorded so a later sync will skip it rather than re-import it.
-- **Spam and Trash included.** Gmail message listing uses
-  `includeSpamTrash=True`.
-- **SQLite metadata database** with foreign-key enforcement, write-ahead
-  logging (WAL), and `synchronous=FULL`.
-- **Sharded message storage.** The repository allocates shard directories in
-  SQLite and limits each shard to 500 message files.
-- **Integrity checks.** Before an incremental sync, the script checks that
-  indexed message files exist, match their recorded size and SHA-256 digest,
-  and that there are no unexpected `.eml`, `.tmp`, or `.deleting` files.
-- **Schema migration.** A recognised schema-v1 repository is migrated to
-  schema version 2 without rewriting existing message files.
-- **Single-line progress display.** The terminal progress line is refreshed
-  every ten messages, showing checked, newly imported, and failed counts.
+The message scan includes Spam and Trash. Gmail drafts are a separate Gmail API resource and are not explicitly extracted by this version. Gmail account configuration (such as filters, forwarding rules and signatures) is also outside the current message-repository import.
 
-## How it works
+## 2. Requirements
 
-1. The script loads its service-account key and mailbox configuration from
-   environment variables.
-2. It creates delegated credentials for the configured Workspace mailbox and
-   verifies the mailbox address returned by Gmail.
-3. It retrieves the Gmail label catalogue.
-4. It determines whether the target is a new repository or an existing,
-   recognised repository.
-5. For an existing repository, it checks the stored files before syncing.
-6. It paginates through Gmail message IDs. For each non-tombstoned ID:
-   - if the message is new locally, it fetches the raw message and stores it;
-   - if the message already exists locally, it fetches metadata only and
-     refreshes the stored Gmail-label snapshot.
-7. It reports the final number of messages newly imported and any failures.
-
-The Gmail API does not provide a reliable total count as the paginated scan is
-underway, so the progress display deliberately does not show a percentage.
-
-## Requirements
-
-- Python **3.10 or later** is recommended.
-- A Google Workspace account and administrative access to configure
-  domain-wide delegation.
+- Python 3.9 or later is recommended.
 - A Google Cloud project with the Gmail API enabled.
-- A service account with domain-wide delegation enabled and a downloaded JSON
-  key file.
-- Local disk space for the message files and SQLite database.
-- Network access to Google APIs while authenticating and importing/syncing.
-  The repository itself is local, but this importer needs an internet
-  connection to contact Gmail.
+- Network access during authentication and imports.
+- A local filesystem with enough free space for the messages and SQLite database.
 
-Python packages:
+Install the Python dependencies in the same Python environment that will run the script:
 
-- `google-auth`
-- `google-api-python-client`
-
-The Python standard library supplies SQLite, hashing, filesystem operations,
-and the other utilities used by the script.
-
-## Google Workspace and OAuth setup
-
-This importer uses **service-account authentication with Google Workspace
-domain-wide delegation**, rather than an interactive OAuth consent flow. This
-is suitable for server Linux.
-
-### 1. Create a Google Cloud project
-
-Create or select a project in the Google Cloud Console and enable the
-**Gmail API** for that project.
-
-### 2. Create a service account
-
-Create a service account for this importer. Enable **domain-wide delegation**
-for the service account and note its numeric OAuth client ID.
-
-### 3. Authorise domain-wide delegation in Workspace
-
-In the Google Workspace Admin console, add the service account's numeric
-client ID to the domain-wide delegation authorisation list.
-
-Authorise this exact OAuth scope:
-
-```text
-https://www.googleapis.com/auth/gmail.readonly
+```bash
+python -m pip install --upgrade \
+  google-api-python-client \
+  google-auth \
+  google-auth-oauthlib
 ```
 
-The scope is read-only. Do not add broader Gmail scopes unless the application
-is deliberately redesigned and the security implications reviewed.
+`google-auth-oauthlib` is needed for the one-time personal Gmail authorisation command. The normal OAuth import on the Pi uses the saved token and does not open a browser.
 
-### 4. Create and protect a JSON key
+## 3. Choose the authentication flow
 
-Create a JSON key for the service account and transfer it securely to the
-Linux host. A recommended location is:
+| Account type | Authentication | Where interactive setup happens | Normal import |
+|---|---|---|---|
+| Google Workspace | Service account + domain-wide delegation | Google Cloud and Workspace Admin configuration | Headless on Pi |
+| Personal `gmail.com` | OAuth 2.0 Desktop app | Mac/PC/Linux computer with a browser | Headless on Pi |
 
-```text
-~/.config/gmail-local-repository/service-account.json
-```
+Use one authentication method per invocation. The same script supports both.
 
-Restrict access to the key:
+---
+
+## 4. Google Workspace setup (existing flow)
+
+This is the existing Workspace configuration. The personal Gmail OAuth addition does not replace it.
+
+### 4.1 Google Cloud configuration
+
+1. Open the Google Cloud project used for the importer.
+2. Enable the **Gmail API**.
+3. Create or retain the service account used by the importer.
+4. Enable **domain-wide delegation** for that service account.
+5. Record its numeric OAuth client ID.
+6. Create a JSON key for the service account and transfer it securely to the Raspberry Pi.
+
+### 4.2 Workspace Admin configuration
+
+1. Open the Google Workspace Admin console.
+2. Go to **Security → Access and data control → API controls → Manage Domain Wide Delegation** (labels may vary slightly).
+3. Add the service account's numeric Client ID.
+4. Authorise exactly this OAuth scope:
+
+   ```text
+   https://www.googleapis.com/auth/gmail.readonly
+   ```
+
+5. Allow time for the delegation change to propagate.
+
+### 4.3 Store the service-account key on the Pi
+
+For example:
 
 ```bash
 mkdir -p "$HOME/.config/gmail-local-repository"
 chmod 700 "$HOME/.config/gmail-local-repository"
+cp /secure/location/service-account.json \
+  "$HOME/.config/gmail-local-repository/service-account.json"
 chmod 600 "$HOME/.config/gmail-local-repository/service-account.json"
 ```
 
-The last command assumes the key has already been copied to that location.
+Keep the key outside the repository and source-code directory. Do not commit it to version control or share it.
 
-### 5. Confirm the setup
-
-You can use `test_gmail_service_account.py` to test the service account 
-credentials. Help is provided by running with the `-h`, `--help` flags.
-
-The importer authenticates as the mailbox specified by
-`GMAIL_IMPERSONATE_USER`. It checks the profile returned by Gmail and stops if
-Google reports a different mailbox.
-
-The service account's private key is sensitive: anyone who obtains it may be
-able to use the delegated permissions authorised for that service account.
-Protect it, do not commit it to source control, and rotate/revoke it if it is
-exposed.
-
-## Install
-
-On the Linux host, create a virtual environment (recommended):
+### 4.4 Configure and run a Workspace import
 
 ```bash
-sudo apt update
-sudo apt install -y python3 python3-venv
-
-mkdir -p "$HOME/gmail-importer"
-python3 -m venv "$HOME/gmail-importer/venv"
-
-"$HOME/gmail-importer/venv/bin/python" -m pip install --upgrade pip
-"$HOME/gmail-importer/venv/bin/python" -m pip install \
-    google-auth google-api-python-client
-```
-
-Copy `gmail_local_repository_api.py` into the project directory, for example:
-
-```text
-/home/pi/gmail-importer/gmail_local_repository_api.py
-```
-
-Use the virtual environment's Python executable both to install dependencies
-and to run the script. Installing packages with one Python interpreter and
-running the script with another can cause errors such as
-`ModuleNotFoundError: No module named 'google'`.
-
-Check the command-line help:
-
-```bash
-"$HOME/gmail-importer/venv/bin/python" \
-    "$HOME/gmail-importer/gmail_local_repository_api.py" --help
-```
-
-## Configuration
-
-The script is configured using environment variables.
-
-| Variable | Required | Purpose |
-|---|---:|---|
-| `GOOGLE_SERVICE_ACCOUNT_FILE` | Yes | Full path to the service-account JSON key |
-| `GMAIL_IMPERSONATE_USER` | Yes | Workspace mailbox address to import |
-| `DB_LOCATION` | No | Parent directory for repositories; defaults to `./data` |
-
-Example:
-
-```bash
+export GMAIL_AUTH_METHOD="workspace"
 export GOOGLE_SERVICE_ACCOUNT_FILE="$HOME/.config/gmail-local-repository/service-account.json"
 export GMAIL_IMPERSONATE_USER="you@yourdomain.com"
-export DB_LOCATION="$HOME/mail-data"
+export DB_LOCATION="$HOME/gmail-data"
+
+python gmail_local_repository_api.py
 ```
 
-The repository for the mailbox is created below `DB_LOCATION`, in a directory
-named using a URL-encoded version of the mailbox address. For example, the
-mailbox `you@yourdomain.com` will normally be stored under:
+For compatibility, the importer also infers Workspace mode when `GOOGLE_SERVICE_ACCOUNT_FILE` and `GMAIL_IMPERSONATE_USER` are set and `GMAIL_AUTH_METHOD` is omitted. Existing Workspace environment configuration therefore continues to work without needing the new variable.
 
-```text
-$HOME/mail-data/you%40yourdomain.com/
-```
+### 4.5 Existing Workspace authentication test
 
-The script does not currently provide command-line options for choosing a
-mailbox or repository path; use the environment variables above.
-
-## Run the importer
-
-Run it from a shell after setting the environment variables:
-
-```bash
-"$HOME/gmail-importer/venv/bin/python" \
-    "$HOME/gmail-importer/gmail_local_repository_api.py"
-```
-
-Alternatively, export the variables in a small shell script that you keep
-private and run that script. Do not put the service-account JSON key itself
-inside the repository.
-
-### First run
-
-If the target repository directory does not exist or is empty, the script
-starts an **initial import**.
-
-A non-empty directory is not automatically treated as a repository. It must
-contain a recognised `repository.json`, `repository.db`, and `messages/`
-directory. If those are missing or the marker is not recognised, the script
-stops rather than guessing what the directory contains.
-
-### Subsequent runs
-
-If the target is a recognised repository, the script starts an
-**incremental sync**. It scans Gmail's message IDs and imports messages that
-are not already present and are not tombstoned.
-
-Existing message content is not downloaded again. Existing messages receive a
-metadata fetch so the source-side Gmail-label snapshot can be refreshed.
-
-### Exit status
-
-- `0`: scan completed without per-message import failures.
-- `1`: scan completed, but one or more messages failed to retrieve or import.
-- `2`: setup, authentication, repository validation, or another top-level
-  error prevented normal completion.
-
-## Progress and logging
-
-During a scan, the script refreshes one terminal line every ten messages.
-For example:
-
-```text
-Progress: checked 1,250 | imported 1,247 | failed 3
-```
-
-- `checked` is the number of Gmail message IDs encountered in this scan.
-- `imported` is the number of messages newly stored during this run.
-- `failed` is the number of individual messages that could not be retrieved
-  or imported.
-
-The progress line is not a percentage because the total number of messages
-is not known reliably at the start of the paginated scan. Normal log messages
-include timestamps and are written to the terminal. A final summary is printed
-when the scan completes.
-
-## Repository layout
-
-A typical repository looks like this:
-
-```text
-<DB_LOCATION>/
-└── <encoded-mailbox-address>/
-    ├── repository.json
-    ├── repository.db
-    ├── repository.db-shm
-    ├── repository.db-wal
-    └── messages/
-        ├── 000001/
-        │   ├── <gmail-message-id>.eml
-        │   └── ...
-        ├── 000002/
-        │   └── ...
-        └── ...
-```
-
-The SQLite `-wal` and `-shm` files may appear while the database is open.
-They are SQLite working files, not additional message stores.
-
-Each message shard is limited to 500 indexed message files. Shard allocation is
-recorded in SQLite rather than derived from Gmail IDs, which are not
-sequential.
-
-`repository.json` identifies the repository and records its schema version,
-mailbox, and creation timestamp.
-
-## Data model
-
-The database currently contains these principal tables:
-
-| Table | Purpose |
-|---|---|
-| `repository_info` | Repository identity and schema metadata |
-| `folders` | Local folder names |
-| `message_shards` | Shard directory allocation and file counts |
-| `messages` | Gmail ID, thread ID, file location, size, SHA-256, dates, and local read/starred fields |
-| `folder_messages` | Local message-to-folder memberships |
-| `deleted_messages` | Tombstones for locally deleted Gmail IDs |
-| `gmail_labels` | Gmail label catalogue and optional local-folder mapping |
-| `gmail_message_labels` | Current source-side label snapshot for each message |
-
-The Gmail API message ID (`id`) is the canonical identity used by the
-repository. The Gmail thread ID is stored as optional metadata. The RFC 822
-`Message-ID` header is not used as the unique key because it may be absent or
-duplicated.
-
-### Gmail labels and local folders
-
-Gmail labels and local folders are related during the initial import, but they
-are not the same thing:
-
-- During initial import, the script creates a local folder for each Gmail
-  label and adds messages to the corresponding local folders.
-- On later syncs, changes to Gmail labels update the source metadata tables.
-  They do not remove or add local folder memberships for messages that already
-  exist locally.
-- A newly encountered message is assigned to local folders for labels that
-  already have a local-folder mapping.
-- A Gmail label first seen during a later sync is recorded as source metadata;
-  it does not automatically create a new local folder.
-
-This separation prevents changes made in Gmail from silently reorganising the
-local repository.
-
-## Initial import and incremental sync
-
-| Behaviour | Initial import | Incremental sync |
-|---|---|---|
-| List Gmail messages | Yes | Yes |
-| Include Spam and Trash | Yes | Yes |
-| Download raw content for new local messages | Yes | Yes, for newly discovered messages |
-| Re-download existing message bodies | Not applicable | No |
-| Fetch metadata for existing messages | Not applicable | Yes |
-| Record Gmail label state | Yes | Refreshes source snapshot |
-| Create initial local folders from Gmail labels | Yes | No new folders for newly created Gmail labels |
-| Delete local data when Gmail message is missing | No | No |
-| Skip tombstoned Gmail IDs | Yes | Yes |
-
-The current incremental implementation scans the complete Gmail message-ID
-listing on every run. This ensures it can discover previously unseen messages
-without relying on a saved cursor, but it is not yet optimised for very large
-mailboxes: it also makes a metadata API request for each already-imported,
-non-tombstoned message.
-
-## Data integrity and preservation
-
-### Message files
-
-For each new message, the script:
-
-1. Requests Gmail API `format="raw"`.
-2. Base64url-decodes the API's raw field into bytes.
-3. Writes those bytes to a temporary file in the destination shard.
-4. Flushes and synchronises the file.
-5. Renames it into its final `.eml` filename.
-6. Records the file size and SHA-256 digest in SQLite.
-
-The importer does not parse and reconstruct the message, decode and re-encode
-MIME parts, normalise line endings, or rewrite headers.
-
-**Important qualification:** these are the raw RFC 2822 message bytes returned
-by Gmail's API after decoding its `raw` field. Google does not guarantee that
-this representation is byte-for-byte identical to the original message as
-first transmitted over SMTP.
-
-### Existing repository checks
-
-Before an incremental sync, the script checks:
-
-- every database-indexed message file exists;
-- each file's size matches the database;
-- each file's SHA-256 digest matches the database;
-- there are no untracked `.eml` files;
-- there are no leftover `.tmp` or `.deleting` files;
-- shard counts do not exceed the configured limit.
-
-If a problem is found, the script stops and reports it rather than silently
-deleting or rewriting files. Investigate and repair the repository before
-running another sync.
-
-### Deletions
-
-A message deleted from Gmail is not deleted from the local repository.
-
-The script contains an internal `delete_local_message()` helper that removes
-an active local message and records its Gmail ID in `deleted_messages`. The
-tombstone is checked on future syncs, preventing that ID from being imported
-again. **This helper is not currently exposed through a command-line option or
-a supported user-facing deletion workflow.** Do not treat local deletion as an
-available CLI feature yet.
-
-A tombstone only protects the active repository. It cannot erase copies held
-on disconnected backup media.
-
-## Backups
-
-A backup should be a consistent copy of the **entire repository**, including:
-
-- `repository.json`;
-- `repository.db`;
-- all message shard directories and `.eml` files.
-
-Because SQLite uses WAL mode, do not assume that copying only
-`repository.db` while the importer is running produces a complete snapshot.
-For a simple filesystem backup, stop the importer first and ensure SQLite has
-closed cleanly. Alternatively, use SQLite's online backup facilities or a
-snapshot method that captures the database and message files consistently.
-
-Keep backups on separate physical storage and verify them periodically.
-A backup is a separate copy: deleting a message from the active repository
-does not automatically remove it from old or disconnected backups. Define
-your own retention and destruction process if deletion must apply to backups
-as well.
-
-## Security
-
-- The OAuth scope is read-only: `gmail.readonly`.
-- The service-account JSON key is a credential and must be protected.
-- Keep the key outside the repository and outside source control.
-- Restrict the key file to the account that runs the importer (`chmod 600`).
-- Restrict the key's parent directory (`chmod 700`).
-- Review and revoke domain-wide delegation authorisations and rotate the key
-  if it is exposed or no longer needed.
-- Protect the repository and backups: imported email may contain sensitive
-  personal or business information.
-
-The script does not currently encrypt message files or the SQLite database at
-rest. Use operating-system or storage-level encryption if encryption at rest
-is required.
-
-## Current limitations and planned work
-
-The following are **not implemented as complete user-facing features** in
-this version:
-
-- **No local IMAP or POP3 server.** The repository is not yet exposed to mail
-  clients. The importer itself only imports and indexes messages.
-- **No supported local deletion command.** The tombstone deletion helper is
-  present internally, but there is no CLI or interactive deletion interface.
-- **No backup automation.** Backups and retention are managed separately.
-- **No encryption at rest built into the application.**
-- **No incremental Gmail history cursor.** Every run scans all message IDs and
-  fetches metadata for existing messages. This will need optimisation for
-  large mailboxes.
-- **No concurrent-run protection.** Do not run two copies against the same
-  repository at the same time. Concurrent imports could race during shard
-  allocation or file creation.
-- **No explicit retry/backoff policy** for transient Google API failures.
-  Individual message failures are counted and logged; the run exits with
-  status 1 if any occur.
-- **No automatic repair of orphaned files or database inconsistencies.** The
-  integrity check stops and asks for investigation rather than guessing.
-- **No Gmail-to-local propagation.** Local state is not written back to Gmail.
-
-The database includes local read/starred fields, but this importer does not
-currently provide a user interface or command to manage them.
-
-## Troubleshooting
-
-### `ModuleNotFoundError: No module named 'google'`
-
-The Google client libraries are not installed in the Python environment used
-to run the script. Install them using the same interpreter:
-
-```bash
-/path/to/venv/bin/python -m pip install --upgrade \
-    google-auth google-api-python-client
-```
-
-Then run the script with that same `/path/to/venv/bin/python`.
-
-### Service-account key file not found
-
-Check that `GOOGLE_SERVICE_ACCOUNT_FILE` points to the JSON key file and that
-the file exists and is readable by the account running the script:
-
-```bash
-ls -l "$GOOGLE_SERVICE_ACCOUNT_FILE"
-```
-
-### Permission warning for the key
-
-Restrict permissions:
-
-```bash
-chmod 700 "$(dirname "$GOOGLE_SERVICE_ACCOUNT_FILE")"
-chmod 600 "$GOOGLE_SERVICE_ACCOUNT_FILE"
-```
-
-### Gmail API `accessNotConfigured` / API not enabled
-
-Enable the Gmail API in the Google Cloud project associated with the service
-account. Confirm that the correct project is selected.
-
-### `unauthorized_client` or insufficient permission
-
-Check all of the following:
-
-- domain-wide delegation is enabled on the service account;
-- the service account's numeric client ID is authorised in Workspace Admin;
-- the authorised scope exactly matches
-  `https://www.googleapis.com/auth/gmail.readonly`;
-- `GMAIL_IMPERSONATE_USER` is a mailbox in the Workspace domain;
-- the key belongs to the service account whose client ID was authorised.
-
-### Requested mailbox does not match Gmail profile
-
-Check the spelling of `GMAIL_IMPERSONATE_USER` and confirm that the delegated
-account is authorised to access that mailbox.
-
-### Repository integrity check fails
-
-Do not delete or rename files at random. Preserve a copy of the repository
-before attempting repairs. The error should identify missing, altered, or
-untracked files. Compare against a known-good backup if available.
-
-### A run reports individual message failures
-
-The importer logs the affected Gmail message ID and the exception. The run
-continues with other messages, then exits with status `1` if any message
-failed. Resolve the underlying API, permission, network, or local storage
-problem and run the importer again; already imported messages are not
-re-downloaded as raw content.
+The separate `test_gmail_service_account.py` diagnostic can still be used to test the Workspace service-account configuration. It does not import or modify messages.
 
 ---
 
-## Project principle
+## 5. Personal Gmail setup (one-time off-device authorisation)
 
-**Import once, preserve locally, and keep the repository independent of Gmail.**
-Gmail is used to acquire messages; local storage and its metadata become the
-working copy. Keep verified backups before relying on the repository as the
-only copy.
+The Raspberry Pi does **not** need a browser. Run the `--authorise` command on a Mac, Windows PC or Linux computer that has a browser. The command uses a loopback listener on that same computer (`127.0.0.1`); it does not connect to the Pi, expose a public callback URL, or require port forwarding or tunnelling.
+
+### 5.1 Create/configure the Google Cloud project
+
+You can use a separate Google Cloud project for personal Gmail OAuth, or a suitable existing project.
+
+1. Open Google Cloud Console and select the project.
+2. Enable the **Gmail API**.
+3. Configure the OAuth consent screen / Google Auth Platform branding and audience.
+4. For personal `gmail.com` accounts, configure the audience as **External**.
+5. Add the Google account you will authorise as a test user while testing.
+6. Create an OAuth Client ID with application type **Desktop app**.
+7. Download the client JSON file. Keep it available on the computer where you will run `--authorise`.
+
+The OAuth client is a Desktop/installed-app client, not a Web application client. The script uses the installed-app loopback redirect and PKCE support provided by Google's OAuth client library.
+
+### 5.2 Understand Google's publishing/testing status
+
+The Gmail `gmail.readonly` scope is a restricted scope. For an app used only by you (or a small number of personally known users), Google's personal-use exception may allow use without completing the full public-app verification process. Google can still show an unverified-app warning and apply a user cap.
+
+**Do not leave the OAuth consent configuration in Testing for unattended long-term use.** Google documents that authorisations for external test users expire after seven days, including offline refresh tokens for scopes such as Gmail. For ongoing use, review the app's publishing status and Google's current personal-use exception/verification requirements. Publishing to Production avoids the Testing-mode seven-day expiry, but it does not itself mean Google has verified the app or removed all warnings/limits.
+
+If this importer is later distributed broadly to unrelated users, revisit Google's restricted-scope verification requirements before doing so.
+
+### 5.3 Run authorisation on the computer with a browser
+
+Install the dependencies on that computer, then run the same importer script:
+
+```bash
+python -m pip install --upgrade \
+  google-api-python-client google-auth google-auth-oauthlib
+
+python gmail_local_repository_api.py \
+  --authorise \
+  --account "you@gmail.com" \
+  --oauth-client-file "$HOME/Downloads/client_secret_xxxxx.json" \
+  --output "$HOME/personal-gmail-token.json"
+```
+
+What happens:
+
+1. The script reads the Desktop OAuth client JSON.
+2. It requests only `gmail.readonly` and requests offline access.
+3. It opens your default browser to Google's sign-in/consent page.
+4. You select the intended personal Gmail account and approve access.
+5. Google redirects the browser to a temporary loopback listener on the authorising computer.
+6. The script exchanges the authorisation result, checks that Gmail reports the requested account address, and saves a refreshable token JSON file.
+7. The token file is written with owner-only file permissions (`600`).
+
+If the browser does not open automatically, the script prints the authorisation URL. Open that URL in a browser on the same computer where the command is running.
+
+The script checks the returned Gmail profile before saving the token, so authorising the wrong Google account will not silently create a token for the requested address.
+
+### 5.4 Transfer the token to the Raspberry Pi
+
+The token file is a credential. Transfer it over SSH/SCP or another secure method. Do not email it, put it in a public cloud folder, commit it to source control, or include it in an ordinary repository backup without protecting that backup.
+
+For example, first create the destination directory on the Pi:
+
+```bash
+ssh pi@raspberrypi 'mkdir -p ~/.config/gmail-local-repository && chmod 700 ~/.config/gmail-local-repository'
+```
+
+Then transfer the token (replace the host and paths as appropriate):
+
+```bash
+scp "$HOME/personal-gmail-token.json" \
+  pi@raspberrypi:~/.config/gmail-local-repository/personal-gmail-token.json
+```
+
+On the Pi, restrict the token file permissions:
+
+```bash
+chmod 600 "$HOME/.config/gmail-local-repository/personal-gmail-token.json"
+```
+
+The token JSON contains the refresh token and OAuth client information needed by the Google credential library. The Desktop client JSON does not normally need to be separately installed on the Pi for this token-based import flow.
+
+### 5.5 Configure and run personal Gmail imports on the Pi
+
+```bash
+export GMAIL_AUTH_METHOD="oauth"
+export GMAIL_ACCOUNT="you@gmail.com"
+export GMAIL_OAUTH_TOKEN_FILE="$HOME/.config/gmail-local-repository/personal-gmail-token.json"
+export DB_LOCATION="$HOME/gmail-data"
+
+python gmail_local_repository_api.py
+```
+
+The Pi reads the token, refreshes an expired access token automatically, and uses the same Gmail API import code as Workspace. When a refreshed token is written back, the script uses an atomic replacement and owner-only file permissions.
+
+No browser, OAuth client download, App Password, IMAP connection, tunnel, or manual token refresh is needed for normal imports.
+
+### 5.6 Reauthorisation
+
+If Google revokes the grant, the refresh token expires, the token file is lost, or the OAuth client/scopes change:
+
+1. Run the `--authorise` command again on the computer with a browser.
+2. Use the same OAuth Desktop client and the intended Gmail account.
+3. Transfer the newly created token to the Pi, replacing the old token.
+4. Restore `chmod 600` on the Pi token file.
+5. Run the importer again.
+
+The script deliberately stops with an explanatory error if the token cannot be refreshed; it does not fall back to Workspace credentials or silently switch accounts.
+
+---
+
+## 6. Configuration reference
+
+### Common
+
+| Variable | Required | Description |
+|---|---:|---|
+| `GMAIL_AUTH_METHOD` | No, but recommended | `workspace` or `oauth`. If omitted, the script infers the method from the configured credential variables. |
+| `DB_LOCATION` | No | Parent directory for account repositories. Defaults to `./data`. |
+
+### Workspace
+
+| Variable | Required for Workspace | Description |
+|---|---:|---|
+| `GOOGLE_SERVICE_ACCOUNT_FILE` | Yes | Path to service-account JSON key. |
+| `GMAIL_IMPERSONATE_USER` | Yes | Workspace mailbox to impersonate. |
+
+### Personal Gmail OAuth
+
+| Variable | Required for OAuth | Description |
+|---|---:|---|
+| `GMAIL_ACCOUNT` | Yes | Personal Gmail address represented by the token. |
+| `GMAIL_OAUTH_TOKEN_FILE` | Yes | Path to the token JSON created by `--authorise` and transferred to the Pi. |
+
+### Authorisation command options
+
+| Option | Required with `--authorise` | Description |
+|---|---:|---|
+| `--authorise` | Yes | Starts personal Gmail OAuth authorisation. |
+| `--account` | Yes | Gmail address to authorise and verify. |
+| `--oauth-client-file` | Yes | Downloaded Google OAuth Desktop client JSON. |
+| `--output` | Yes | Output token path. The token is written owner-only. |
+
+`--help` displays command usage without requiring any account environment variables.
+
+## 7. Repository layout and import behaviour
+
+For each account, the repository is created under:
+
+```text
+DB_LOCATION/<URL-encoded-email-address>/
+    repository.json
+    repository.db
+    messages/
+        <shard directories>/
+            <message files>.eml
+```
+
+- A missing or empty account directory starts an initial import.
+- A recognised repository starts an incremental sync.
+- A non-empty directory that is not a recognised complete repository is rejected.
+- A message is stored once, regardless of the number of Gmail labels attached to it.
+- Initial Gmail labels are mapped to local folders. Existing local folder membership is not rewritten from later Gmail label changes.
+- Gmail deletions do not delete local files.
+- The local repository is not synchronised back to Gmail.
+
+## 8. Troubleshooting
+
+### `ModuleNotFoundError: No module named 'google'`
+
+Install the dependencies into the exact Python environment used to run the importer:
+
+```bash
+python -m pip install --upgrade google-api-python-client google-auth google-auth-oauthlib
+```
+
+If using a virtual environment, activate it first or use that environment's full Python path for both `pip` and the script.
+
+### Workspace: `accessNotConfigured` or Gmail API disabled
+
+Check that the Gmail API is enabled in the Google Cloud project associated with the service account.
+
+### Workspace: delegation or permission error
+
+Check that domain-wide delegation is enabled for the service account, the numeric Client ID is authorised in Workspace Admin, and the scope is exactly `https://www.googleapis.com/auth/gmail.readonly`.
+
+### Personal Gmail: app not available / access denied
+
+Check that the OAuth audience is External, the account is listed as a test user if the app is in Testing, and the Gmail API is enabled. Review Google's current OAuth publishing and verification requirements.
+
+### Personal Gmail: token expires after seven days
+
+The OAuth consent configuration is likely still in Testing. Google documents a seven-day expiry for external test-user authorisations using Gmail scopes. Review the Publishing status and personal-use exception described above.
+
+### Personal Gmail: token has expired or been revoked
+
+Re-run `--authorise` on a computer with a browser and transfer the replacement token to the Pi. Confirm that you authorised the intended Gmail account.
+
+### Wrong account authenticated
+
+The script checks the Gmail profile email address against the configured account and stops if they differ. Correct the account variable or create a token for the intended account.
+
+
+### Gmail API quota / rate-limit errors
+
+Gmail API requests use adaptive pacing and bounded retries to reduce repeated
+quota rejections:
+
+- Requests are initially spaced about 0.25 seconds apart (approximately four
+  requests per second). This pacing applies across Gmail API operations.
+- HTTP 403 with `rateLimitExceeded`, `userRateLimitExceeded` or
+  `quotaExceeded`, and HTTP 429 responses, cause the importer to slow its
+  subsequent requests. The interval can grow to five seconds between requests.
+- After sustained successful requests, the interval gradually recovers toward
+  its normal rate.
+- If the response includes an HTTP `Retry-After` header or Google's structured
+  retry-delay information, that server-provided delay is used. Otherwise the
+  importer uses exponential backoff with jitter, starting at about two seconds
+  and capped at about 120 seconds.
+- HTTP 5xx responses are retried with backoff but do not independently change
+  the quota pacing rate. Other HTTP 403 responses (for example, an
+  authentication or permission problem) are not retried.
+- The importer makes up to 9 attempts per request (the initial attempt plus
+  8 retries). This applies to Gmail profile, label-list, message-list page and
+  individual message retrieval requests.
+- Pressing Ctrl-C interrupts both normal request pacing and quota backoff waits.
+  Gmail API HTTP operations and credential refreshes also have a 30-second
+  network timeout, preventing a stalled connection from waiting indefinitely.
+  The importer logs a clean interruption, closes SQLite, and exits with code
+  `130`; messages committed before the interruption remain available for the
+  next run.
+
+If Google continues rejecting a request after all retries, the importer stops
+rather than marking hundreds of subsequent messages as failed. It exits with
+code `3`. Successfully imported messages remain in the repository. Wait before
+trying again; the next run scans Gmail again and skips messages already stored.
+
+### Insufficient disk space / disk full
+
+Before importing and before processing each message, the importer checks the
+free space on the filesystem containing the repository. By default it keeps a
+64 MiB safety reserve. Change this with `GMAIL_MIN_FREE_BYTES`:
+
+```bash
+# Keep the default 64 MiB reserve (no setting required)
+
+# Example: keep a 256 MiB reserve
+export GMAIL_MIN_FREE_BYTES=268435456
+
+# Disable the proactive reserve check (not recommended)
+export GMAIL_MIN_FREE_BYTES=0
+```
+
+If free space falls below the reserve, the importer stops before starting the
+next message. If a write nevertheless fails with filesystem `ENOSPC` or
+SQLite `SQLITE_FULL`, it stops immediately. The current message's file/database
+operation is rolled back or cleaned up where possible; messages completed
+before the failure remain committed. SQLite is closed normally on exit so its
+WAL state can be recovered by SQLite on the next open. The importer exits with
+code `4`.
+
+After freeing disk space, run the same command again. The importer recognises
+the existing repository and resumes by skipping messages already recorded.
+Do not manually delete `.tmp` files or database files to force a restart; if an
+interrupted file is reported by the repository integrity check, inspect it
+before proceeding.
+
+### Exit codes
+
+| Code | Meaning |
+|---:|---|
+| `0` | Scan completed without message failures |
+| `1` | Scan completed, but one or more individual messages failed |
+| `2` | Configuration, authentication, repository or non-retryable API error |
+| `3` | Gmail quota/transient API errors persisted after retries; rerun later |
+| `4` | Insufficient disk space or filesystem full; free space and rerun |
+| `130` | User interrupted the importer with Ctrl-C; rerun to resume |
+
+### Repository integrity errors
+
+Do not delete or rename files to silence an integrity error. The importer stops if it finds missing, orphaned, temporary, or interrupted message files. Inspect the named paths and restore from a known-good backup if necessary.
+
+## 10. Operational cautions
+
+- Do not run two importer processes concurrently against the same repository.
+- Keep service-account keys and OAuth token files outside the repository and source tree.
+- Protect offline backups: they contain message contents and account metadata. Protect token files separately; the repository itself does not need the OAuth token to be readable.
+- Live end-to-end personal Gmail OAuth and full mailbox import have not yet been validated in this environment. The source has been syntax-checked and local retry/disk-safety helper tests have passed; live validation must still be performed against the user's Google Cloud OAuth client and account.
+
+## 11. Google documentation
+
+- [OAuth 2.0 for Desktop Apps](https://developers.google.com/identity/protocols/oauth2/native-app)
+- [Using OAuth 2.0 for Google APIs](https://developers.google.com/identity/protocols/oauth2/)
+- [Gmail API authorization](https://developers.google.com/workspace/gmail/api/auth)
+- [Restricted-scope verification and personal-use exception](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification)
