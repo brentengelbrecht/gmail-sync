@@ -2,20 +2,30 @@
 """
 Gmail-to-local email repository importer.
 
-The local repository is authoritative. Gmail is only an import source:
-- messages are stored once, as the raw RFC 2822 bytes returned by Gmail's API;
-- Gmail labels are recorded separately as source metadata;
-- initial Gmail labels are copied into local folder memberships;
-- later Gmail label changes do not reorganise existing local messages;
-- later Gmail deletions never delete local data;
-- locally deleted Gmail messages are suppressed by a tombstone.
+The local repository is authoritative. Gmail is only an import source.
 
-Authentication supports both Google Workspace service accounts with domain-wide
-delegation and personal Gmail OAuth 2.0. Personal OAuth is authorised on a
-computer with a browser; its token is then transferred to the headless Pi.
+Repository ownership model:
+- Every active message has a canonical record in the messages table.
+- ALL EMAIL is a normal persisted folder in folders, with a folder_messages
+  relationship to every active message.
+- Every message is stored exactly once, as raw RFC 2822 bytes returned
+  by Gmail's API.
+- Local folders and Gmail labels are organisational references to
+  canonical message records, never separate physical message copies.
+- Archiving removes INBOX membership, not ALL EMAIL membership.
+- Gmail label changes never reorganise existing local folders or remove
+  ALL EMAIL membership.
+- Gmail deletions never delete local data.
+- Only explicit local deletion removes a message and all its folder memberships.
+- Locally deleted Gmail messages are suppressed by a tombstone.
 
-Configuration is supplied through environment variables. Run with --help for
-the required variables and usage information.
+Authentication supports both Google Workspace service accounts with
+domain-wide delegation and personal Gmail OAuth 2.0. Personal OAuth is
+authorised on a computer with a browser; its token is then transferred
+to the headless Pi.
+
+Configuration is supplied through environment variables. Run with
+--help for the required variables and usage information.
 """
 
 from __future__ import annotations
@@ -50,6 +60,7 @@ from googleapiclient.errors import HttpError
 
 APP_NAME = "Gmail Local Repository Importer"
 SCHEMA_VERSION = 2
+ALL_EMAIL_FOLDER_NAME = "ALL EMAIL"
 MAX_FILES_PER_SHARD = 500
 DEFAULT_DB_LOCATION = "./data"
 REPOSITORY_MARKER = "repository.json"
@@ -365,6 +376,13 @@ Examples for personal Gmail imports on the Pi:
   {Path(sys.argv[0]).name}
 
 Import behaviour:
+  - ALL EMAIL is a normal persisted folder in folders/folder_messages.
+  - Every active message has exactly one ALL EMAIL membership relationship.
+  - Each message has exactly one canonical physical .eml file.
+  - Local folders and Gmail labels reference canonical messages.
+  - Gmail's All Mail view is the import source; Spam and Trash are excluded
+    from new imports.
+  - ALL EMAIL is exposed as an ordinary local folder for generic IMAP serving.
   - A missing or empty user repository directory starts an initial import.
   - A recognised repository starts an incremental sync.
   - An unrecognised or incomplete non-empty directory is rejected.
@@ -375,10 +393,8 @@ Import behaviour:
   - Retry-After / Google retry-delay hints are honoured when supplied; otherwise
     bounded exponential backoff with jitter is used.
   - Ctrl-C interrupts request pacing and retry waits; Gmail HTTP operations
-    also have a 30-second timeout. The importer exits with status 130 after
-    closing the local database.
-  - Disk-space reserve is checked before import writes; disk-full errors stop
-    the run immediately and preserve previously completed messages.
+    also have a 30-second timeout.
+  - Disk-space reserve is checked before import writes.
 """,
     )
     parser.add_argument(
@@ -631,6 +647,66 @@ def create_schema(connection: sqlite3.Connection, mailbox: str) -> None:
     connection.commit()
 
 
+def ensure_indexes(connection: sqlite3.Connection) -> None:
+    """Ensure required performance and foreign-key indexes exist.
+
+    Safe to run repeatedly against both new and existing repositories.
+    Does not alter tables or stored data.
+    """
+    statements = (
+        """
+        CREATE INDEX IF NOT EXISTS idx_messages_shard
+        ON messages(shard_id)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_gmail_labels_local_folder
+        ON gmail_labels(local_folder_id)
+        """,
+    )
+
+    with transaction(connection):
+        for statement in statements:
+            connection.execute(statement)
+
+
+def ensure_all_email_folder(connection: sqlite3.Connection) -> int:
+    """Create the ordinary ALL EMAIL folder and ensure it contains every message.
+
+    This is deliberately persisted through the same folders/folder_messages
+    tables used by every other mailbox. The IMAP server therefore needs no
+    special knowledge of the canonical messages table.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with transaction(connection):
+        connection.execute(
+            """
+            INSERT INTO folders(name, uidvalidity, last_seen_at)
+            VALUES (?, NULL, ?)
+            ON CONFLICT(name) DO UPDATE SET last_seen_at = excluded.last_seen_at
+            """,
+            (ALL_EMAIL_FOLDER_NAME, now),
+        )
+        row = connection.execute(
+            "SELECT folder_id FROM folders WHERE name = ?",
+            (ALL_EMAIL_FOLDER_NAME,),
+        ).fetchone()
+        folder_id = int(row["folder_id"])
+
+        # Backfill existing repositories and repair any missing ALL EMAIL
+        # relationships without disturbing other folder memberships.
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO folder_messages(
+                folder_id, message_id, gmail_uid, first_seen_at
+            )
+            SELECT ?, message_id, NULL, imported_at
+            FROM messages
+            """,
+            (folder_id,),
+        )
+    return folder_id
+
+
 def migrate_schema(connection: sqlite3.Connection, repository_path: Path,
                    mailbox: str) -> None:
     """Migrate the previous IMAP schema (v1) without changing stored messages."""
@@ -682,10 +758,13 @@ def migrate_schema(connection: sqlite3.Connection, repository_path: Path,
 
 def ensure_repository(connection: sqlite3.Connection, repository_path: Path,
                       mailbox: str, mode: str) -> None:
+
     if mode == "initial":
         repository_path.mkdir(parents=True, exist_ok=True)
         (repository_path / "messages").mkdir(exist_ok=True)
         create_schema(connection, mailbox)
+        ensure_indexes(connection)
+        ensure_all_email_folder(connection)
         write_repository_marker(repository_path, mailbox)
         logging.info("Created new repository at %s", repository_path)
         return
@@ -720,6 +799,8 @@ def ensure_repository(connection: sqlite3.Connection, repository_path: Path,
     ).fetchone()
     old_version = int(existing_version["value"]) if existing_version else 0
     migrate_schema(connection, repository_path, mailbox)
+    ensure_indexes(connection)
+    ensure_all_email_folder(connection)
     if old_version != SCHEMA_VERSION:
         write_repository_marker(repository_path, mailbox)
 
@@ -949,22 +1030,39 @@ def register_gmail_labels(connection: sqlite3.Connection, labels: list[dict],
 
 
 def list_gmail_message_ids(service):
-    """Yield every Gmail message ID, following all API pagination tokens."""
+    """
+    Yield every message in Gmail's All Mail collection.
+
+    Gmail's default messages.list behaviour excludes Spam and Trash.
+    This corresponds to Gmail's All Mail view.
+
+    Every successfully imported message is also added to the persisted
+    local ALL EMAIL folder by import_one_message().
+    """
     page_token = None
+
     while True:
         kwargs = {
             "userId": "me",
             "maxResults": API_PAGE_SIZE,
-            "includeSpamTrash": True,
+            "includeSpamTrash": False,
         }
+
         if page_token:
             kwargs["pageToken"] = page_token
-        response = execute_google_request(service.users().messages().list(**kwargs), "Gmail message listing page")
+
+        response = execute_google_request(
+            service.users().messages().list(**kwargs),
+            "Gmail All Mail listing page",
+        )
+
         for item in response.get("messages", []):
             message_id = item.get("id")
             if message_id:
                 yield message_id
+
         page_token = response.get("nextPageToken")
+
         if not page_token:
             break
 
@@ -1085,7 +1183,7 @@ def refresh_source_labels(connection: sqlite3.Connection, message_id: int,
 
 def import_one_message(connection: sqlite3.Connection, repository_path: Path,
                         message: dict, label_mapping: dict[str, Optional[int]],
-                        mode: str) -> bool:
+                        mode: str, all_email_folder_id: int) -> bool:
     gm_id = str(message["gm_id"])
     tombstone = connection.execute(
         "SELECT 1 FROM deleted_messages WHERE gm_id = ?", (gm_id,)
@@ -1152,6 +1250,17 @@ def import_one_message(connection: sqlite3.Connection, repository_path: Path,
                     connection, message_id, label_ids, now
                 )
 
+                # ALL EMAIL is an ordinary persisted folder. Every new
+                # canonical message is linked to it in the same transaction.
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO folder_messages(
+                        folder_id, message_id, gmail_uid, first_seen_at
+                    ) VALUES (?, ?, NULL, ?)
+                    """,
+                    (all_email_folder_id, message_id, now),
+                )
+
                 # For both initial and incremental imports, a newly imported
                 # message is placed in the local folders mapped to its labels.
                 for label_id in label_ids:
@@ -1195,6 +1304,15 @@ def sync_gmail(connection: sqlite3.Connection, service,
                repository_path: Path, mode: str,
                labels: list[dict]) -> tuple[int, int]:
     label_mapping = register_gmail_labels(connection, labels, mode)
+    all_email_row = connection.execute(
+        "SELECT folder_id FROM folders WHERE name = ?",
+        (ALL_EMAIL_FOLDER_NAME,),
+    ).fetchone()
+    if all_email_row is None:
+        raise RuntimeError(
+            "The ALL EMAIL folder is missing. Repository initialisation failed."
+        )
+    all_email_folder_id = int(all_email_row["folder_id"])
 
     total_imported = 0
     total_failed = 0
@@ -1221,7 +1339,8 @@ def sync_gmail(connection: sqlite3.Connection, service,
                         service, gm_id, include_raw=(existing is None)
                     )
                     if import_one_message(
-                        connection, repository_path, message, label_mapping, mode
+                        connection, repository_path, message, label_mapping, mode,
+                        all_email_folder_id,
                     ):
                         total_imported += 1
             except (DiskSpaceExhausted, GmailRateLimitExhausted):
@@ -1358,6 +1477,29 @@ def sha256_file(path: Path) -> str:
 def verify_repository_files(connection: sqlite3.Connection,
                             repository_path: Path) -> None:
     """Check DB/file consistency; never silently delete or rewrite files."""
+    all_email_row = connection.execute(
+        "SELECT folder_id FROM folders WHERE name = ?",
+        (ALL_EMAIL_FOLDER_NAME,),
+    ).fetchone()
+    if all_email_row is None:
+        raise RuntimeError("Repository integrity check failed: ALL EMAIL folder is missing.")
+
+    missing_all_email = connection.execute(
+        """
+        SELECT COUNT(*) AS missing_count
+        FROM messages m
+        LEFT JOIN folder_messages fm
+          ON fm.message_id = m.message_id AND fm.folder_id = ?
+        WHERE fm.message_id IS NULL
+        """,
+        (int(all_email_row["folder_id"]),),
+    ).fetchone()["missing_count"]
+    if int(missing_all_email):
+        raise RuntimeError(
+            "Repository integrity check failed: "
+            f"{int(missing_all_email):,} message(s) are missing ALL EMAIL membership."
+        )
+
     missing = []
     rows = connection.execute(
         """
