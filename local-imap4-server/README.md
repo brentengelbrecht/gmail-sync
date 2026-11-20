@@ -1,8 +1,14 @@
 # imap_archive_server
 
-A small, read-only IMAP server for browsing a Gmail local repository (the
-output of `gmail_local_repository_api.py`) with an ordinary mail client such as
-Thunderbird.
+A small, read-only IMAP server for browsing local mail repositories with an
+ordinary mail client such as Thunderbird. It serves repositories produced by
+either importer, side by side:
+
+- `gmail_local_repository_api.py` (`gmail-local-repository`, schema 2)
+- `imap_local_repository.py` (`imap-local-repository`, schema 1), for any
+  generic IMAP4 server
+
+Each repository is one account; mix them freely in one `.ini`.
 
 It is intended to run on a Raspberry Pi (or any Linux box) on a trusted local
 network. It exists so you can **check, read and verify** the archived mail
@@ -64,9 +70,10 @@ that layout directly and presents it over IMAP:
   packages.
 - Python built with OpenSSL (standard on Raspberry Pi OS), which provides
   `hashlib.scrypt` for password hashing.
-- One or more repositories produced by `gmail_local_repository_api.py`, each a directory
-  containing `repository.json` (schema version 2), `repository.db` and
-  `messages/`.
+- One or more repositories produced by `gmail_local_repository_api.py`
+  (`repository.json` schema version 2) or `imap_local_repository.py` (schema
+  version 1), each a directory containing `repository.json`, `repository.db`
+  and `messages/`.
 - Read access to that directory. SQLite may need to create or touch the
   `repository.db-shm` / `-wal` helper files, so the user running the server
   should normally have write access to the repository *directory* (the server
@@ -194,6 +201,8 @@ inline. This table is a summary.
 | | `verify_on_read` | `true` | Check size and SHA-256 when a message is first opened. Mismatches are logged, not blocked. |
 | `[tls]` | `cert` | empty | PEM certificate. Setting it enables implicit TLS. Empty = plain IMAP. |
 | | `key` | empty | PEM private key; may be empty if it is in the certificate file. |
+| | `port` | empty | Port for TLS (for example `1993`). Empty = TLS is served on `[server] port`. Requires `cert`. |
+| | `also_plain` | `false` | With `[tls] port` set, also open the unencrypted `[server] port`. |
 | `[auth]` | `password_file` | `imap_archive_server.passwd` | Hashed password file (see below). Relative paths are relative to the `.ini`. |
 | `[logging]` | `level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
 | | `file` | empty | Log to this file instead of the terminal. |
@@ -206,7 +215,11 @@ inline. This table is a summary.
 | `uidvalidity` | `auto` | `auto` derives it from `created_at` in `repository.json`. Otherwise a fixed number from 1 to 4294967295. |
 | `hide_folders` | empty | Folder-name patterns to hide (`*`, `?`, `[seq]`; case-sensitive; comma- or newline-separated). Example: `CATEGORY_*, CHAT`. |
 
-Example with two accounts:
+`hide_folders` uses shell-style patterns, so `[` starts a character class. To
+hide folders such as `[Gmail]/All Mail` or `[Gmail]/Spam`, write the bracket as
+`[[]`: `hide_folders = [[]Gmail]/All Mail, [[]Gmail]/Spam`.
+
+Example with two accounts (one Gmail API repository, one generic IMAP):
 
 ```ini
 [account:alice]
@@ -216,6 +229,10 @@ hide_folders = CATEGORY_*
 [account:work]
 path = /home/pi/mail-data/work%40example.org
 ```
+
+For a repository created by `imap_local_repository.py`, `path` is the
+repository directory under its `DB_LOCATION` (the URL-encoded username, or the
+`IMAP_REPOSITORY_NAME` you set). Nothing else changes.
 
 ### Rules for the `.ini` file
 
@@ -372,7 +389,21 @@ cert = /home/pi/imap.crt
 key = /home/pi/imap.key
 ```
 
-This enables **implicit TLS** (like port 993). Set the client's connection
+To carry TLS on its own port (the usual unprivileged substitute for 993), add:
+
+```ini
+[tls]
+cert = /home/pi/imap.crt
+key = /home/pi/imap.key
+port = 1993
+```
+
+The server then listens for TLS on 1993 and does **not** open the unencrypted
+`[server] port`. Set `also_plain = true` if you also want the plaintext port
+(for example 1143) open at the same time. Without `[tls] port`, the `[server]
+port` itself carries TLS when a certificate is set, as in earlier versions.
+
+Setting a certificate enables **implicit TLS** (like port 993). Set the client's connection
 security to "SSL/TLS", not "STARTTLS". The server does not implement STARTTLS.
 Thunderbird will ask you to accept the self-signed certificate on first
 connect.
@@ -394,6 +425,9 @@ connect.
 
 Notes:
 
+- For IMAP repositories, folders are the IMAP folders the importer copied
+  (`INBOX`, `Sent`, `Spam`, ...), shown by their decoded names. `--verify`
+  labels each message by its SHA-256 instead of a Gmail ID.
 - Folders include whatever the importer created from Gmail labels, which may
   include system labels such as Spam, Trash, Starred or category labels. Use
   `hide_folders` to hide ones you don't want to see.
@@ -458,7 +492,7 @@ fall back gracefully.
 | `... got '1143\n\nallow_networks = ...'` | The next option line starts with spaces. Remove the leading spaces so it starts in column 1. |
 | `unknown option 'xxx' in [server]` | Misspelled option name. Compare against the shipped `.ini`. |
 | `cannot read .../repository.json` | The account's `path` is wrong. It must be the mailbox directory itself, e.g. `.../mail-data/you%40yourdomain.com`. |
-| `schema_version ... is not supported` | The repository is not schema version 2. |
+| `unrecognised repository application` / `schema_version ... is not supported` | The directory is not a Gmail (schema 2) or IMAP (schema 1) repository, or was made by a newer importer. |
 | Thunderbird: "failed to find the settings" | Expected. Use **Configure manually**. |
 | Connection refused / times out | Server not running, `host` set to `127.0.0.1`, wrong port, or firewall. |
 | Connects, then drops immediately | Log shows `rejected connection ... (not in allow_networks)`. Add your client's network. |

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Read-only, multi-account IMAP4rev1 server for Gmail local repositories
-(each: repository.json + repository.db + messages/<shard>/<file>.eml).
+Read-only, multi-account IMAP4rev1 server for local mail repositories
+(each: repository.json + repository.db + messages/<shard>/<file>.eml), as produced by
+gmail_local_repository_api.py (schema 2) or imap_local_repository.py (schema 1).
+Gmail and generic-IMAP repositories can be served side by side, one account each.
 
   - Accounts        = one [account:LOGIN] section per repository in the .ini; the login
                       name used by the mail client selects the repository, and a session
@@ -10,7 +12,7 @@ Read-only, multi-account IMAP4rev1 server for Gmail local repositories
                       managed with --set-password
   - IMAP UID        = messages.message_id (stable, increasing, 32-bit safe)
   - UIDVALIDITY     = derived from repository.json "created_at" (or set in the .ini)
-  - Folders         = the `folders` table (one per imported Gmail label)
+  - Folders         = the `folders` table (one per imported Gmail label / IMAP folder)
   - Flags           = is_read -> \\Seen, is_starred -> \\Flagged
   - Message bytes   = served exactly as stored; size/SHA-256 checked against the database
   - Database access = opened with PRAGMA query_only=ON (safe alongside a running sync, WAL mode)
@@ -56,7 +58,7 @@ MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 
 
 # ============================================================================
-# BACKEND: Gmail local repository layout
+# BACKEND: local repository layout (Gmail API importer or generic IMAP importer)
 # ============================================================================
 @dataclass
 class Msg:
@@ -90,6 +92,15 @@ def parse_date(*candidates):
     return datetime.fromtimestamp(0, timezone.utc)
 
 
+# application name in repository.json -> supported schema versions. Both repository types
+# share the tables and columns this server reads (folders, folder_messages, messages,
+# message_shards); they differ only in the importer-specific message identifier.
+SUPPORTED_REPOSITORIES = {
+    "gmail-local-repository": {2},
+    "imap-local-repository": {1},
+}
+
+
 class ArchiveBackend:
     def __init__(self, repo_dir, uidvalidity="auto", hide=()):
         self.repo_dir = repo_dir
@@ -100,12 +111,18 @@ class ArchiveBackend:
                 meta = json.load(f)
         except (OSError, ValueError) as e:
             raise SystemExit(f"cannot read {meta_path}: {e}")
-        if meta.get("application") != "gmail-local-repository":
-            raise SystemExit(f"{meta_path}: not a gmail-local-repository repository")
-        if meta.get("schema_version") != 2:
-            raise SystemExit(f"{meta_path}: schema_version {meta.get('schema_version')!r} "
-                             "is not supported (this server reads schema 2)")
-        self.mailbox = meta.get("mailbox")
+        app, version = meta.get("application"), meta.get("schema_version")
+        if app not in SUPPORTED_REPOSITORIES:
+            raise SystemExit(f"{meta_path}: unrecognised repository application {app!r} "
+                             f"(supported: {', '.join(sorted(SUPPORTED_REPOSITORIES))})")
+        if version not in SUPPORTED_REPOSITORIES[app]:
+            wanted = ", ".join(str(v) for v in sorted(SUPPORTED_REPOSITORIES[app]))
+            raise SystemExit(f"{meta_path}: schema_version {version!r} is not supported "
+                             f"for {app} (this server reads schema {wanted})")
+        self.application = app
+        # Gmail repositories record "mailbox"; IMAP repositories record "username" and "host".
+        self.mailbox = meta.get("mailbox") or (
+            f"{meta.get('username')} on {meta.get('host')}" if meta.get("username") else None)
         self.db_path = os.path.join(repo_dir, "repository.db")
         self.msg_root = os.path.join(repo_dir, "messages")
         for needed in (self.db_path, self.msg_root):
@@ -160,30 +177,35 @@ class ArchiveBackend:
         return self.uidvalidity, msgs
 
     def all_messages(self):
-        """Every message in the repository (ignores hide_folders; used by --verify)."""
+        """Every message in the repository (ignores hide_folders; used by --verify).
+
+        Yields (identifier, shard/filename, size, sha256). The identifier is only a label
+        for reports: the Gmail ID for Gmail repositories, the SHA-256 for IMAP ones.
+        """
+        ident = "m.gm_id" if self.application == "gmail-local-repository" else "m.sha256"
         with closing(self._db()) as db:
             yield from db.execute(
-                "SELECT m.gm_id, s.directory_name || '/' || m.filename, m.message_size, m.sha256 "
+                f"SELECT {ident}, s.directory_name || '/' || m.filename, m.message_size, m.sha256 "
                 "FROM messages m JOIN message_shards s ON s.shard_id = m.shard_id "
                 "ORDER BY m.message_id")
 
 
 def verify(backend):
     checked = bad = 0
-    for gm_id, rel, size, sha in backend.all_messages():
+    for ident, rel, size, sha in backend.all_messages():
         checked += 1
         path = os.path.join(backend.msg_root, rel)
         try:
             raw = load_raw(path)
         except OSError as e:
-            print(f"MISSING   {gm_id}  {path}: {e.strerror}")
+            print(f"MISSING   {ident}  {path}: {e.strerror}")
             bad += 1
             continue
         if len(raw) != size:
-            print(f"SIZE      {gm_id}  {path}: file {len(raw)} != db {size}")
+            print(f"SIZE      {ident}  {path}: file {len(raw)} != db {size}")
             bad += 1
         elif hashlib.sha256(raw).hexdigest() != sha.lower():
-            print(f"SHA256    {gm_id}  {path}: digest mismatch")
+            print(f"SHA256    {ident}  {path}: digest mismatch")
             bad += 1
     print(f"checked {checked} messages, {bad} problem(s)")
     return 1 if bad else 0
@@ -1010,7 +1032,7 @@ DEFAULT_CONFIG = os.path.join(SCRIPT_DIR, "imap_archive_server.ini")
 GLOBAL_SCHEMA = {
     "server": {"host": "0.0.0.0", "port": "1143", "allow_networks": "",
                "cache_messages": "16", "verify_on_read": "true"},
-    "tls": {"cert": "", "key": ""},
+    "tls": {"cert": "", "key": "", "port": "", "also_plain": "false"},
     "auth": {"password_file": "imap_archive_server.passwd"},
     "logging": {"level": "INFO", "file": ""},
 }
@@ -1037,6 +1059,8 @@ class Config:
     verify_on_read: bool = True
     cert: str = ""
     key: str = ""
+    tls_port: int = 0           # 0 = not set: [server] port itself carries TLS when a cert is set
+    also_plain: bool = False    # with tls_port: also open the unencrypted [server] port
     password_file: str = ""
     log_level: str = "INFO"
     log_file: str = ""
@@ -1120,6 +1144,21 @@ def load_config(path):
     cert, key = rpath(get("tls", "cert")), rpath(get("tls", "key"))
     if key and not cert:
         raise SystemExit(f"{path}: [tls] key is set but cert is not")
+    tls_port_raw = get("tls", "port")
+    tls_port = 0
+    if tls_port_raw:
+        tls_port = as_int("tls", "port", 1, 65535)
+        if not cert:
+            raise SystemExit(f"{path}: [tls] port is set but cert is not; TLS needs a certificate")
+    also_plain_raw = get("tls", "also_plain").lower()
+    if also_plain_raw not in ("true", "false", "yes", "no", "on", "off", "1", "0"):
+        raise SystemExit(f"{path}: [tls] also_plain must be true or false, "
+                         f"got {also_plain_raw!r}{hint(also_plain_raw)}")
+    also_plain = also_plain_raw in ("true", "yes", "on", "1")
+    if also_plain and not tls_port:
+        raise SystemExit(f"{path}: [tls] also_plain only applies when [tls] port is set")
+    if tls_port and also_plain and tls_port == as_int("server", "port", 1, 65535):
+        raise SystemExit(f"{path}: [tls] port and [server] port must differ when also_plain is true")
 
     accounts = {}
     for sec in cp.sections():
@@ -1147,7 +1186,7 @@ def load_config(path):
         allow_networks=nets,
         cache_messages=as_int("server", "cache_messages", 1, 10000),
         verify_on_read=verify_raw in ("true", "yes", "on", "1"),
-        cert=cert, key=key,
+        cert=cert, key=key, tls_port=tls_port, also_plain=also_plain,
         password_file=rpath(get("auth", "password_file")),
         log_level=level,
         log_file=rpath(get("logging", "file")),
@@ -1229,9 +1268,24 @@ async def serve(cfg, accounts):
     if cfg.cert:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cfg.cert, cfg.key or None)
-    server = await asyncio.start_server(handle, cfg.host, cfg.port, ssl=ctx)
-    log.info("listening on %s:%d (%s), %d account(s)", cfg.host, cfg.port,
-             "TLS" if ctx else "plaintext", len(accounts))
+
+    # Listeners as (port, ssl context). Without [tls] port the old behaviour holds: one
+    # listener on [server] port, TLS if a certificate is set. With [tls] port, TLS listens
+    # there and the unencrypted [server] port is opened only if also_plain = true.
+    if cfg.tls_port:
+        listeners = [(cfg.tls_port, ctx)]
+        if cfg.also_plain:
+            listeners.append((cfg.port, None))
+    else:
+        listeners = [(cfg.port, ctx)]
+    servers = []
+    for port, lctx in listeners:
+        servers.append(await asyncio.start_server(handle, cfg.host, port, ssl=lctx))
+        log.info("listening on %s:%d (%s), %d account(s)", cfg.host, port,
+                 "TLS" if lctx else "plaintext", len(accounts))
+        if not lctx:
+            log.warning("port %d is unencrypted: passwords and mail cross the network in clear text",
+                        port)
     for a in accounts.values():
         log.info("account %s: mailbox %s, UIDVALIDITY %d, %d hidden-folder pattern(s)",
                  a.name, a.backend.mailbox, a.backend.uidvalidity, len(a.backend.hide))
@@ -1244,18 +1298,19 @@ async def serve(cfg, accounts):
             pass
     await stop.wait()
     log.info("shutting down (%d open connection(s))", len(writers))
-    server.close()
+    for server in servers:
+        server.close()
     for w in list(writers):
         w.close()
     try:
-        await asyncio.wait_for(server.wait_closed(), 5)
+        await asyncio.wait_for(asyncio.gather(*(sv.wait_closed() for sv in servers)), 5)
     except asyncio.TimeoutError:
         log.warning("some connections did not close within 5 seconds")
 
 
 def main():
     ap = argparse.ArgumentParser(description="Read-only multi-account IMAP server for "
-                                             "Gmail local repositories")
+                                             "local mail repositories (Gmail API or IMAP importer)")
     ap.add_argument("--config", default=DEFAULT_CONFIG,
                     help="path to the .ini file (default: imap_archive_server.ini beside the script)")
     ap.add_argument("--set-password", metavar="LOGIN",

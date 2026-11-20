@@ -408,3 +408,24 @@ scripted `imaplib` suite as `tests/`.
   mistakes in this project were configuration slips, not protocol bugs.
 - Update `README.md` (features, config table, limitations) and this file when
   behaviour or decisions change.
+
+
+## Supporting both importers (added)
+
+The backend accepts two repository types, listed in `SUPPORTED_REPOSITORIES`
+(`application` -> allowed `schema_version` values):
+
+- `gmail-local-repository`, schema 2 (Gmail API importer; messages keyed by `gm_id`)
+- `imap-local-repository`, schema 1 (generic IMAP importer; messages keyed by
+  the SHA-256 of their bytes, no `gm_id`)
+
+Both provide the columns the server reads: `folders.name`, `folder_messages`,
+`messages(message_id, filename, message_size, sha256, internal_date,
+imported_at, is_read, is_starred)` and `message_shards.directory_name`. The only
+importer-specific column the server touched was `messages.gm_id` (used to label
+`--verify` output); `all_messages()` now uses `gm_id` for Gmail repositories and
+`sha256` for IMAP ones. `repository.json` records `mailbox` for Gmail and
+`username` + `host` for IMAP; `ArchiveBackend.mailbox` is a display label only.
+
+Adding another repository type means adding it to `SUPPORTED_REPOSITORIES` and
+making sure it provides the columns above.
