@@ -332,75 +332,39 @@ silently switch accounts.
 
 ### Common
 
-  ----------------------------------------------------------------------
-  Variable                                 Required Description
-  --------------------- --------------------------- --------------------
-  `GMAIL_AUTH_METHOD`           No, but recommended `workspace` or
-                                                    `oauth`. If omitted,
-                                                    the script infers
-                                                    the method from the
-                                                    configured
-                                                    credential
-                                                    variables.
 
-  `DB_LOCATION`                                  No Parent directory for
-                                                    account
-                                                    repositories.
-                                                    Defaults to
-                                                    `./data`.
-  ----------------------------------------------------------------------
+|Variable            |            Required| Description   |
+|--------------------|--------------------|---------------|
+|`GMAIL_AUTH_METHOD` | No, but recommended|`workspace` or `oauth`. If omitted, the script infers the method from the configured credential variables.|
+|`DB_LOCATION`       |                  No|Parent directory for account repositories. Defaults to `./data`.|
+
 
 ### Workspace
 
-  ---------------------------------------------------------------------------
-  Variable                          Required for Workspace Description
-  ------------------------------- ------------------------ ------------------
-  `GOOGLE_SERVICE_ACCOUNT_FILE`                        Yes Path to
-                                                           service-account
-                                                           JSON key.
 
-  `GMAIL_IMPERSONATE_USER`                             Yes Workspace mailbox
-                                                           to impersonate.
-  ---------------------------------------------------------------------------
+|Variable            |            Required| Description   |
+|--------------------|--------------------|---------------|
+|`GOOGLE_SERVICE_ACCOUNT_FILE`|  Yes | Path to service-account JSON key.|
+|`GMAIL_IMPERSONATE_USER`     |  Yes | Workspace mailbox to impersonate.|
+
 
 ### Personal Gmail OAuth
 
-  ------------------------------------------------------------------------
-  Variable                          Required for OAuth Description
-  -------------------------- ------------------------- -------------------
-  `GMAIL_ACCOUNT`                                  Yes Personal Gmail
-                                                       address represented
-                                                       by the token.
+|Variable            |   Required for OAuth| Description   |
+|--------------------|--------------------|---------------|
+|`GMAIL_ACCOUNT`     |     Yes | Personal Gmail address represented by the token.|
+|`GMAIL_OAUTH_TOKEN_FILE`| Yes | Path to the token JSON created by `--authorise` and transferred to the Pi.|
 
-  `GMAIL_OAUTH_TOKEN_FILE`                         Yes Path to the token
-                                                       JSON created by
-                                                       `--authorise` and
-                                                       transferred to the
-                                                       Pi.
-  ------------------------------------------------------------------------
 
 ### Authorisation command options
 
-  -----------------------------------------------------------------------
-  Option                               Required with Description
-                                       `--authorise` 
-  ----------------------- -------------------------- --------------------
-  `--authorise`                                  Yes Starts personal
-                                                     Gmail OAuth
-                                                     authorisation.
+|Option            |   Required with `--authorise`| Description|
+|------------------|------------------|---------------|
+|`--authorise`     |              Yes | Starts personal Gmail OAuth authorisation.|
+|`--account`       |              Yes | Gmail address to authorise and verify.|
+|`--oauth-client-file` |          Yes | Downloaded Google OAuth Desktop client JSON.|
+|`--output`            |          Yes | Output token path. The token is written owner-only.|
 
-  `--account`                                    Yes Gmail address to
-                                                     authorise and
-                                                     verify.
-
-  `--oauth-client-file`                          Yes Downloaded Google
-                                                     OAuth Desktop client
-                                                     JSON.
-
-  `--output`                                     Yes Output token path.
-                                                     The token is written
-                                                     owner-only.
-  -----------------------------------------------------------------------
 
 `--help` displays command usage without requiring any account
 environment variables.
@@ -500,11 +464,6 @@ The `ALL EMAIL` backfill and membership handling have been exercised
 with local SQLite tests, including repeat-run idempotency, membership on
 new import, and membership removal on explicit local deletion. The
 script has also passed Python syntax compilation.
-
-A live end-to-end Gmail import has not been validated as part of those
-local tests. The Gmail History API is not implemented; each normal run
-still scans the Gmail message list and skips messages already in the
-local repository.
 
 ## 9. Troubleshooting
 
@@ -662,7 +621,7 @@ backup if necessary.
 ## 10. Operational cautions
 
 -   Do not run two importer processes concurrently against the same
-    repository.
+    repository (i.e. email account).
 -   Keep service-account keys and OAuth token files outside the
     repository and source tree.
 -   Protect offline backups: they contain message contents and account
