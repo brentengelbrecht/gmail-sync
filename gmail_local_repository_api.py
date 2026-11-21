@@ -59,7 +59,7 @@ from googleapiclient.errors import HttpError
 
 
 APP_NAME = "Gmail Local Repository Importer"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ALL_EMAIL_FOLDER_NAME = "ALL EMAIL"
 MAX_FILES_PER_SHARD = 500
 DEFAULT_DB_LOCATION = "./data"
@@ -376,25 +376,20 @@ Examples for personal Gmail imports on the Pi:
   {Path(sys.argv[0]).name}
 
 Import behaviour:
-  - ALL EMAIL is a normal persisted folder in folders/folder_messages.
-  - Every active message has exactly one ALL EMAIL membership relationship.
-  - Each message has exactly one canonical physical .eml file.
-  - Local folders and Gmail labels reference canonical messages.
-  - Gmail's All Mail view is the import source; Spam and Trash are excluded
-    from new imports.
-  - ALL EMAIL is exposed as an ordinary local folder for generic IMAP serving.
   - A missing or empty user repository directory starts an initial import.
-  - A recognised repository starts an incremental sync.
-  - An unrecognised or incomplete non-empty directory is rejected.
-  - Gmail deletions and label removals do not delete local messages.
-  - Gmail label changes are recorded separately from local folder membership.
-  - Local deletion tombstones suppress future re-imports.
-  - Gmail API requests are paced adaptively; quota failures slow subsequent calls.
-  - Retry-After / Google retry-delay hints are honoured when supplied; otherwise
-    bounded exponential backoff with jitter is used.
-  - Ctrl-C interrupts request pacing and retry waits; Gmail HTTP operations
-    also have a 30-second timeout.
-  - Disk-space reserve is checked before import writes.
+  - A recognised repository syncs from its saved Gmail History API
+    checkpoint; a full All Mail scan is used only for initial import or
+    expired-history recovery.
+  - Existing local messages are checked using metadata; raw message content
+    is downloaded only for newly imported messages.
+  - Every active message has a relationship to the normal persisted
+    ALL EMAIL folder.
+  - Gmail deletions and label removals do not delete local messages or
+    remove their ALL EMAIL membership.
+  - Gmail label changes update source metadata without reorganising
+    existing local folder memberships.
+  - Local deletion removes the message and its folder memberships,
+    including ALL EMAIL, and creates a tombstone to suppress re-import.
 """,
     )
     parser.add_argument(
@@ -500,7 +495,7 @@ def detect_repository_mode(repository_path: Path) -> str:
     if metadata.get("application") != "gmail-local-repository":
         raise RuntimeError(f"Unrecognised repository marker: {marker}")
     version = metadata.get("schema_version")
-    if version not in (1, SCHEMA_VERSION):
+    if version not in (1, 2, SCHEMA_VERSION):
         raise RuntimeError(
             f"Unsupported repository schema version {version!r}; "
             f"this script supports versions 1 and {SCHEMA_VERSION}."
@@ -608,6 +603,12 @@ def create_schema(connection: sqlite3.Connection, mailbox: str) -> None:
             reason TEXT NOT NULL DEFAULT 'local deletion'
         );
 
+        CREATE TABLE sync_state (
+            account_id TEXT PRIMARY KEY,
+            history_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         -- Gmail's labels are a source-side snapshot, not local folders.
         CREATE TABLE gmail_labels (
             label_id TEXT PRIMARY KEY,
@@ -709,7 +710,7 @@ def ensure_all_email_folder(connection: sqlite3.Connection) -> int:
 
 def migrate_schema(connection: sqlite3.Connection, repository_path: Path,
                    mailbox: str) -> None:
-    """Migrate the previous IMAP schema (v1) without changing stored messages."""
+    """Migrate earlier repository schemas without changing stored messages."""
     row = connection.execute(
         "SELECT value FROM repository_info WHERE key = 'schema_version'"
     ).fetchone()
@@ -718,41 +719,50 @@ def migrate_schema(connection: sqlite3.Connection, repository_path: Path,
     version = int(row["value"])
     if version == SCHEMA_VERSION:
         return
-    if version != 1:
+    if version not in (1, 2):
         raise RuntimeError(f"No migration path from repository schema {version}.")
 
     with transaction(connection):
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS gmail_labels (
-                label_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                label_type TEXT,
-                local_folder_id INTEGER,
-                last_seen_at TEXT NOT NULL,
-                FOREIGN KEY(local_folder_id) REFERENCES folders(folder_id)
-            );
-            CREATE TABLE IF NOT EXISTS gmail_message_labels (
-                message_id INTEGER NOT NULL,
-                label_id TEXT NOT NULL,
-                first_seen_at TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL,
-                PRIMARY KEY(message_id, label_id),
-                FOREIGN KEY(message_id) REFERENCES messages(message_id),
-                FOREIGN KEY(label_id) REFERENCES gmail_labels(label_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_gmail_message_labels_label
-                ON gmail_message_labels(label_id);
-            """
+        if version == 1:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS gmail_labels (
+                    label_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    label_type TEXT,
+                    local_folder_id INTEGER,
+                    last_seen_at TEXT NOT NULL,
+                    FOREIGN KEY(local_folder_id) REFERENCES folders(folder_id)
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS gmail_message_labels (
+                    message_id INTEGER NOT NULL,
+                    label_id TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    PRIMARY KEY(message_id, label_id),
+                    FOREIGN KEY(message_id) REFERENCES messages(message_id),
+                    FOREIGN KEY(label_id) REFERENCES gmail_labels(label_id)
+                )"""
+            )
+            connection.execute(
+                """CREATE INDEX IF NOT EXISTS idx_gmail_message_labels_label
+                   ON gmail_message_labels(label_id)"""
+            )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS sync_state (
+                account_id TEXT PRIMARY KEY,
+                history_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
         )
         connection.execute(
             "UPDATE repository_info SET value = ? WHERE key = 'schema_version'",
             (str(SCHEMA_VERSION),),
         )
     logging.info(
-        "Migrated repository database from schema version 1 to %s; "
-        "existing message files were not changed.",
-        SCHEMA_VERSION,
+        "Migrated repository database from schema version %s to %s; "
+        "existing message files were not changed.", version, SCHEMA_VERSION,
     )
 
 
@@ -1029,49 +1039,86 @@ def register_gmail_labels(connection: sqlite3.Connection, labels: list[dict],
     return mapping
 
 
+def get_gmail_history_id(service) -> str:
+    """Return Gmail's current opaque historyId as text."""
+    response = execute_google_request(
+        service.users().getProfile(userId="me"), "Gmail profile/history checkpoint"
+    )
+    history_id = response.get("historyId")
+    if history_id is None:
+        raise RuntimeError("Gmail profile response did not contain a historyId.")
+    return str(history_id)
+
+
 def list_gmail_message_ids(service):
-    """
-    Yield every message in Gmail's All Mail collection.
-
-    Gmail's default messages.list behaviour excludes Spam and Trash.
-    This corresponds to Gmail's All Mail view.
-
-    Every successfully imported message is also added to the persisted
-    local ALL EMAIL folder by import_one_message().
-    """
+    """Yield every message in Gmail's All Mail collection, excluding Spam/Trash."""
     page_token = None
-
     while True:
         kwargs = {
             "userId": "me",
             "maxResults": API_PAGE_SIZE,
             "includeSpamTrash": False,
         }
-
         if page_token:
             kwargs["pageToken"] = page_token
-
         response = execute_google_request(
             service.users().messages().list(**kwargs),
             "Gmail All Mail listing page",
         )
-
         for item in response.get("messages", []):
             message_id = item.get("id")
             if message_id:
-                yield message_id
-
+                yield str(message_id)
         page_token = response.get("nextPageToken")
-
         if not page_token:
             break
 
 
-def fetch_gmail_message(service, gm_id: str, include_raw: bool) -> dict:
-    """Fetch message metadata, optionally including its raw RFC 2822 content.
+def list_gmail_history(service, start_history_id: str):
+    """Yield chronological Gmail history records and return the final checkpoint.
 
-    Existing local messages need only metadata on incremental sync, avoiding
-    repeated downloads of their potentially large message bodies.
+    The returned checkpoint is Gmail's current historyId from the final page
+    response. It is safe to persist only after every yielded change is handled.
+    """
+    page_token = None
+    latest_history_id = None
+    while True:
+        kwargs = {
+            "userId": "me",
+            "startHistoryId": str(start_history_id),
+            "maxResults": API_PAGE_SIZE,
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+        response = execute_google_request(
+            service.users().history().list(**kwargs),
+            f"Gmail history page from {start_history_id}",
+        )
+        if response.get("historyId") is not None:
+            latest_history_id = str(response["historyId"])
+        for record in response.get("history", []):
+            yield record
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    if latest_history_id is None:
+        # Never substitute a later profile historyId here: a change could occur
+        # after the history listing and be skipped by such a checkpoint.
+        raise RuntimeError(
+            "Gmail history.list returned no historyId; refusing to advance "
+            "the sync checkpoint. Rerun the importer."
+        )
+    return latest_history_id
+
+
+def fetch_gmail_message(service, gm_id: str, include_raw: bool) -> dict:
+    """Fetch message metadata, optionally including raw RFC 2822 content.
+
+    Existing local messages need only metadata during a repository sync,
+    avoiding repeated downloads of their potentially large message bodies.
+
+    Incremental sync uses this only for messages affected by Gmail history;
+    raw content is requested only when a message is not already local.
     """
     response_format = "raw" if include_raw else "metadata"
     message = execute_google_request(
@@ -1300,27 +1347,192 @@ def import_one_message(connection: sqlite3.Connection, repository_path: Path,
     return True
 
 
-def sync_gmail(connection: sqlite3.Connection, service,
-               repository_path: Path, mode: str,
-               labels: list[dict]) -> tuple[int, int]:
-    label_mapping = register_gmail_labels(connection, labels, mode)
-    all_email_row = connection.execute(
-        "SELECT folder_id FROM folders WHERE name = ?",
-        (ALL_EMAIL_FOLDER_NAME,),
-    ).fetchone()
-    if all_email_row is None:
-        raise RuntimeError(
-            "The ALL EMAIL folder is missing. Repository initialisation failed."
-        )
-    all_email_folder_id = int(all_email_row["folder_id"])
+def is_gmail_not_found(exc: HttpError) -> bool:
+    return getattr(getattr(exc, "resp", None), "status", None) == 404
 
+
+def save_history_checkpoint(connection: sqlite3.Connection, mailbox: str,
+                            history_id: str) -> None:
+    """Atomically persist the opaque Gmail historyId after a completed sync."""
+    now = datetime.now(timezone.utc).isoformat()
+    with transaction(connection):
+        connection.execute(
+            """INSERT INTO sync_state(account_id, history_id, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(account_id) DO UPDATE SET
+                   history_id = excluded.history_id,
+                   updated_at = excluded.updated_at""",
+            (mailbox.casefold(), str(history_id), now),
+        )
+
+
+def get_saved_history_checkpoint(connection: sqlite3.Connection,
+                                 mailbox: str) -> Optional[str]:
+    row = connection.execute(
+        "SELECT history_id FROM sync_state WHERE account_id = ?",
+        (mailbox.casefold(),),
+    ).fetchone()
+    return str(row["history_id"]) if row else None
+
+
+def process_changed_message(connection: sqlite3.Connection, service,
+                             repository_path: Path, gm_id: str,
+                             label_mapping: dict[str, Optional[int]], mode: str,
+                             all_email_folder_id: int) -> bool:
+    """Refresh one changed Gmail message without changing existing local folders."""
+    if connection.execute(
+        "SELECT 1 FROM deleted_messages WHERE gm_id = ?", (gm_id,)
+    ).fetchone():
+        return False
+
+    existing = connection.execute(
+        "SELECT message_id FROM messages WHERE gm_id = ?", (gm_id,)
+    ).fetchone()
+    try:
+        metadata = fetch_gmail_message(service, gm_id, include_raw=False)
+    except HttpError as exc:
+        # Gmail may have deleted the message after the history event was written.
+        # A remote deletion never removes an already-local copy.
+        if is_gmail_not_found(exc):
+            return False
+        raise
+
+    labels = set(metadata.get("label_ids", []))
+    if existing:
+        # Keep the local copy regardless of remote Spam/Trash placement, but
+        # accurately refresh the source-side Gmail label snapshot.
+        now = datetime.now(timezone.utc).isoformat()
+        with transaction(connection):
+            refresh_source_labels(
+                connection, int(existing["message_id"]),
+                metadata.get("label_ids", []), now,
+            )
+        return False
+
+    if "SPAM" in labels or "TRASH" in labels:
+        # Match the initial All Mail scan for messages not already local.
+        return False
+
+    # A message added during the initial scan, or moved out of Spam/Trash,
+    # may not yet have a local record. Fetch its raw content exactly once.
+    try:
+        message = fetch_gmail_message(service, gm_id, include_raw=True)
+    except HttpError as exc:
+        if is_gmail_not_found(exc):
+            return False
+        raise
+    return import_one_message(
+        connection, repository_path, message, label_mapping, mode,
+        all_email_folder_id,
+    )
+
+
+def process_history(connection: sqlite3.Connection, service,
+                     repository_path: Path, start_history_id: str,
+                     label_mapping: dict[str, Optional[int]], mode: str,
+                     all_email_folder_id: int) -> tuple[str, int]:
+    """Apply all history changes since start_history_id, then return checkpoint."""
+    changed_ids: dict[str, None] = {}
+    ignored_deletions = 0
+    records = 0
+    # Gmail returns history records in chronological order. Coalescing changed
+    # IDs lets us refresh each message from its final current state only once.
+    # messagesDeleted are deliberately not acted upon: local data is authoritative.
+    generator = list_gmail_history(service, start_history_id)
+    while True:
+        try:
+            record = next(generator)
+        except StopIteration as stop:
+            latest_history_id = stop.value
+            break
+        records += 1
+        for item in record.get("messagesAdded", []):
+            message = item.get("message", {})
+            if message.get("id"):
+                changed_ids[str(message["id"])] = None
+        for item in record.get("labelsAdded", []):
+            message = item.get("message", {})
+            if message.get("id"):
+                changed_ids[str(message["id"])] = None
+        for item in record.get("labelsRemoved", []):
+            message = item.get("message", {})
+            if message.get("id"):
+                changed_ids[str(message["id"])] = None
+        ignored_deletions += len(record.get("messagesDeleted", []))
+
+    # Refresh the label catalogue after collecting history so label IDs first
+    # seen during this sync are available when message snapshots are written.
+    current_labels = list_gmail_labels(service)
+    refreshed_mapping = register_gmail_labels(connection, current_labels, "sync")
+    label_mapping.clear()
+    label_mapping.update(refreshed_mapping)
+
+    imported = 0
+    for index, gm_id in enumerate(changed_ids, start=1):
+        check_disk_space(repository_path)
+        if process_changed_message(
+            connection, service, repository_path, gm_id, label_mapping,
+            mode, all_email_folder_id,
+        ):
+            imported += 1
+        if index % 10 == 0:
+            sys.stdout.write(
+                f"\rHistory: processed {index:,} changed message(s) | "
+                f"newly imported {imported:,}"
+            )
+            sys.stdout.flush()
+    if changed_ids and len(changed_ids) % 10:
+        sys.stdout.write(
+            f"\rHistory: processed {len(changed_ids):,} changed message(s) | "
+            f"newly imported {imported:,}"
+        )
+        sys.stdout.flush()
+    if changed_ids:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    logging.info(
+        "Processed Gmail history: %s record(s), %s distinct changed message(s), "
+        "%s remote deletion event(s) ignored; checkpoint %s.",
+        f"{records:,}", f"{len(changed_ids):,}",
+        f"{ignored_deletions:,}", latest_history_id,
+    )
+    return latest_history_id, imported
+
+
+def process_scanned_message(connection: sqlite3.Connection, service,
+                            repository_path: Path, gm_id: str,
+                            label_mapping: dict[str, Optional[int]], mode: str,
+                            all_email_folder_id: int) -> bool:
+    """Import/update one message returned by the All Mail list without a duplicate fetch."""
+    if connection.execute(
+        "SELECT 1 FROM deleted_messages WHERE gm_id = ?", (gm_id,)
+    ).fetchone():
+        return False
+    existing = connection.execute(
+        "SELECT 1 FROM messages WHERE gm_id = ?", (gm_id,)
+    ).fetchone()
+    try:
+        message = fetch_gmail_message(service, gm_id, include_raw=(existing is None))
+    except HttpError as exc:
+        # A message can disappear between messages.list and messages.get.
+        # This is not an import failure and must not prevent checkpointing.
+        if is_gmail_not_found(exc):
+            return False
+        raise
+    return import_one_message(
+        connection, repository_path, message, label_mapping, mode,
+        all_email_folder_id,
+    )
+
+
+def full_all_mail_scan(connection: sqlite3.Connection, service,
+                       repository_path: Path, label_mapping: dict,
+                       mode: str, all_email_folder_id: int) -> tuple[int, int]:
+    """Full paginated All Mail scan used only for first sync or recovery."""
     total_imported = 0
     total_failed = 0
     total_seen = 0
-
-    # Update one terminal line rather than emitting a log entry for every
-    # batch. Gmail's API does not provide a reliable total while paginating,
-    # so show the live checked/imported/failed counts without a percentage.
     progress_line = ""
     try:
         check_disk_space(repository_path)
@@ -1328,38 +1540,21 @@ def sync_gmail(connection: sqlite3.Connection, service,
             check_disk_space(repository_path)
             total_seen += 1
             try:
-                tombstone = connection.execute(
-                    "SELECT 1 FROM deleted_messages WHERE gm_id = ?", (gm_id,)
-                ).fetchone()
-                if not tombstone:
-                    existing = connection.execute(
-                        "SELECT 1 FROM messages WHERE gm_id = ?", (gm_id,)
-                    ).fetchone()
-                    message = fetch_gmail_message(
-                        service, gm_id, include_raw=(existing is None)
-                    )
-                    if import_one_message(
-                        connection, repository_path, message, label_mapping, mode,
-                        all_email_folder_id,
-                    ):
-                        total_imported += 1
+                if process_scanned_message(
+                    connection, service, repository_path, gm_id,
+                    label_mapping, mode, all_email_folder_id,
+                ):
+                    total_imported += 1
             except (DiskSpaceExhausted, GmailRateLimitExhausted):
                 raise
-            except HttpError as exc:
-                total_failed += 1
-                logging.error(
-                    "Gmail API failed retrieving message %s: %s", gm_id, exc
-                )
             except Exception as exc:
                 if is_disk_full_error(exc):
                     raise DiskSpaceExhausted(
                         "The filesystem ran out of space during import. "
-                        "The current message was not committed; earlier completed "
-                        "messages remain available. Free space and rerun to resume."
+                        "Completed messages remain saved; free space and rerun."
                     ) from exc
                 total_failed += 1
                 logging.exception("Failed importing Gmail message %s", gm_id)
-
             if total_seen % 10 == 0:
                 progress_line = (
                     f"Progress: checked {total_seen:,} | "
@@ -1378,11 +1573,94 @@ def sync_gmail(connection: sqlite3.Connection, service,
         if progress_line:
             sys.stdout.write("\n")
             sys.stdout.flush()
-
     logging.info(
-        "Completed Gmail scan: checked %s; newly imported %s; failures %s",
+        "Completed full All Mail scan: checked %s; newly imported %s; failures %s",
         f"{total_seen:,}", f"{total_imported:,}", f"{total_failed:,}",
     )
+    return total_imported, total_failed
+
+
+def sync_gmail(connection: sqlite3.Connection, service,
+               repository_path: Path, mode: str, labels: list[dict],
+               mailbox: str) -> tuple[int, int]:
+    label_mapping = register_gmail_labels(connection, labels, mode)
+    all_email_row = connection.execute(
+        "SELECT folder_id FROM folders WHERE name = ?",
+        (ALL_EMAIL_FOLDER_NAME,),
+    ).fetchone()
+    if all_email_row is None:
+        raise RuntimeError(
+            "The ALL EMAIL folder is missing. Repository initialisation failed."
+        )
+    all_email_folder_id = int(all_email_row["folder_id"])
+
+    saved_history_id = get_saved_history_checkpoint(connection, mailbox)
+    full_scan_required = saved_history_id is None
+    recovery_reason = "initial import" if full_scan_required else None
+    total_imported = 0
+    total_failed = 0
+
+    # Initial sync and expired-history recovery both establish a fresh starting
+    # point BEFORE the full scan, then replay everything that changed meanwhile.
+    while True:
+        if full_scan_required:
+            start_history_id = get_gmail_history_id(service)
+            logging.info(
+                "Starting full All Mail scan (%s); baseline historyId=%s.",
+                recovery_reason or "history recovery", start_history_id,
+            )
+            imported, failed = full_all_mail_scan(
+                connection, service, repository_path, label_mapping,
+                mode, all_email_folder_id,
+            )
+            total_imported += imported
+            total_failed += failed
+            if failed:
+                logging.error(
+                    "Not saving a Gmail history checkpoint because the full scan "
+                    "had %s failed message(s). Rerun to retry.", failed,
+                )
+                return total_imported, total_failed
+        else:
+            start_history_id = str(saved_history_id)
+
+        try:
+            latest_history_id, history_imported = process_history(
+                connection, service, repository_path, start_history_id,
+                label_mapping, mode, all_email_folder_id,
+            )
+            total_imported += history_imported
+        except HttpError as exc:
+            if is_gmail_not_found(exc) and not full_scan_required:
+                logging.warning(
+                    "Gmail historyId %s has expired; preserving the local "
+                    "repository and rebuilding from a fresh All Mail scan.",
+                    start_history_id,
+                )
+                full_scan_required = True
+                recovery_reason = "expired history recovery"
+                saved_history_id = None
+                continue
+            if is_gmail_not_found(exc) and full_scan_required:
+                # An unusually long full scan can outlive the history window.
+                # Retry once from a newer baseline rather than committing a gap.
+                if recovery_reason == "history recovery retry":
+                    raise RuntimeError(
+                        "Gmail history expired repeatedly during full-scan recovery. "
+                        "No checkpoint was saved; rerun the importer."
+                    ) from exc
+                logging.warning(
+                    "History expired during the full scan; restarting with a "
+                    "new baseline to avoid missing changes."
+                )
+                recovery_reason = "history recovery retry"
+                continue
+            raise
+
+        save_history_checkpoint(connection, mailbox, latest_history_id)
+        logging.info("Saved Gmail history checkpoint %s.", latest_history_id)
+        break
+
     return total_imported, total_failed
 
 
@@ -1621,7 +1899,7 @@ def main() -> int:
 
         check_disk_space(repository_path)
         total_imported, total_failed = sync_gmail(
-            connection, service, repository_path, mode, labels
+            connection, service, repository_path, mode, labels, config["mailbox"]
         )
 
         logging.info(
