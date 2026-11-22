@@ -45,6 +45,7 @@ import signal
 import sqlite3
 import ssl
 import sys
+import time
 from collections import OrderedDict
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -96,7 +97,7 @@ def parse_date(*candidates):
 # share the tables and columns this server reads (folders, folder_messages, messages,
 # message_shards); they differ only in the importer-specific message identifier.
 SUPPORTED_REPOSITORIES = {
-    "gmail-local-repository": {2},
+    "gmail-local-repository": {2, 3},
     "imap-local-repository": {1},
 }
 
@@ -217,6 +218,13 @@ def verify(backend):
 class Err(Exception):
     def __init__(self, status, text):
         self.status, self.text = status, text
+
+
+SEARCH_SLICE_SECONDS = 0.05   # longest a SEARCH may run before other connections get a turn
+
+
+class ClientGone(Exception):
+    """The client disconnected while a long command was running; stop quietly."""
 
 
 def crlf(b):
@@ -704,6 +712,8 @@ class Session:
                         raise Err("BAD", "unknown command")
                     text = await h(tokenize(m.group(3) or ""))
                     await self.send(f"{tag} OK {text or cmd.upper() + ' completed'}\r\n")
+                except ClientGone:
+                    break
                 except Err as e:
                     await self.send(f"{tag} {e.status} {e.text}\r\n")
                 except (ValueError, IndexError):
@@ -1001,7 +1011,19 @@ class Session:
         if len(a) >= 2 and isinstance(a[0], str) and a[0].upper() == "CHARSET":
             a = a[2:]
         pred = self.parse_search(a)
-        hits = [(m.uid if uid_mode else i) for i, m in enumerate(self.msgs, 1) if pred(i, m)]
+        # A text search reads and parses every message in the folder. Doing that in one go would freeze the whole
+        # server (every other connection, every other account) for the duration, so work in short time slices,
+        # let the other connections run in between, and give up as soon as this client has disconnected.
+        hits = []
+        slice_end = time.monotonic() + SEARCH_SLICE_SECONDS
+        for i, m in enumerate(self.msgs, 1):
+            if pred(i, m):
+                hits.append(m.uid if uid_mode else i)
+            if time.monotonic() >= slice_end:
+                await asyncio.sleep(0)
+                if self.reader.at_eof():
+                    raise ClientGone()
+                slice_end = time.monotonic() + SEARCH_SLICE_SECONDS
         await self.send(("* SEARCH" + "".join(f" {h}" for h in hits) + "\r\n"))
 
     async def cmd_search(self, a):
