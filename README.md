@@ -18,8 +18,8 @@ repository code. No App Password or IMAP authentication is used.
 
 ## 1. What the importer does
 
--   Creates a local repository on the first run and incrementally
-    imports previously unseen Gmail messages on later runs.
+-   Creates a local repository on the first run. Later runs scan the full
+    Gmail message listing but import only messages not already stored locally.
 -   Lists messages with `includeSpamTrash=False`, matching Gmail's All
     Mail scan and excluding Spam and Trash.
 -   Retrieves new messages in Gmail's `raw` format and stores the
@@ -32,9 +32,11 @@ repository code. No App Password or IMAP authentication is used.
     changes do not reorganise existing local folders.
 -   Does not delete local messages or local folder memberships when
     Gmail messages or labels disappear remotely.
--   Supports explicit local deletion: the message file, canonical
-    database record and folder memberships are removed, and a tombstone
-    prevents a later Gmail scan from re-importing that message.
+-   Provides the `delete_local_message()` module function for explicit
+    local deletion: it removes the message file, canonical database record
+    and folder memberships, and records a tombstone to prevent later
+    Gmail scans from re-importing that message. There is no deletion
+    command-line option in this importer.
 -   Uses Gmail message IDs as the canonical remote identity, rather than
     relying on RFC 822 `Message-ID` headers.
 -   Stores metadata in SQLite and message files in shards containing at
@@ -84,18 +86,11 @@ token and does not open a browser.
 
 ## 3. Choose the authentication flow
 
-  -----------------------------------------------------------------------
-  Account type      Authentication    Where interactive Normal import
-                                      setup happens     
-  ----------------- ----------------- ----------------- -----------------
-  Google Workspace  Service account + Google Cloud and  Headless on Pi
-                    domain-wide       Workspace Admin   
-                    delegation        configuration     
+  |Account type  |    Authentication | Where interactive Normal import setup happens|
+  |---------------------|-----------------------------------------|------------------------------------------------|
+  |Google Workspace | Service account + domain-wide delegation|Google Cloud and Workspace Admin configuration  |
+  |Personal `gmail.com` | OAuth 2.0 Desktop app|Mac/PC/Linux computer with a browser |
 
-  Personal          OAuth 2.0 Desktop Mac/PC/Linux      Headless on Pi
-  `gmail.com`       app               computer with a   
-                                      browser           
-  -----------------------------------------------------------------------
 
 Use one authentication method per invocation. The same script supports
 both.
@@ -332,38 +327,37 @@ silently switch accounts.
 
 ### Common
 
-
-|Variable            |            Required| Description   |
-|--------------------|--------------------|---------------|
-|`GMAIL_AUTH_METHOD` | No, but recommended|`workspace` or `oauth`. If omitted, the script infers the method from the configured credential variables.|
-|`DB_LOCATION`       |                  No|Parent directory for account repositories. Defaults to `./data`.|
+|Variable              |             Required| Description        |
+|----------------------| ---------------------|--------------------|
+|`GMAIL_AUTH_METHOD`   |  No, but recommended | `workspace` or `oauth`. If omitted, the script infers the method from the configured credential variables.|
+|`DB_LOCATION`         |                   No | Parent directory for account repositories. Defaults to `./data`.|
+|`GMAIL_MIN_FREE_BYTES`|                   No | Minimum free-space reserve in bytes. Defaults to 67108864 (64 MiB); set to `0` to disable the check.|
 
 
 ### Workspace
 
-
-|Variable            |            Required| Description   |
-|--------------------|--------------------|---------------|
-|`GOOGLE_SERVICE_ACCOUNT_FILE`|  Yes | Path to service-account JSON key.|
-|`GMAIL_IMPERSONATE_USER`     |  Yes | Workspace mailbox to impersonate.|
+|Variable               |  Required for Workspace  | Description|
+|-------------------------------|--------------------------|----------------------------------|
+|`GOOGLE_SERVICE_ACCOUNT_FILE`  |     Yes | Path to service-account JSON key.|
+|`GMAIL_IMPERSONATE_USER`       |     Yes | Workspace mailbox to impersonate.|
 
 
 ### Personal Gmail OAuth
 
-|Variable            |   Required for OAuth| Description   |
-|--------------------|--------------------|---------------|
-|`GMAIL_ACCOUNT`     |     Yes | Personal Gmail address represented by the token.|
-|`GMAIL_OAUTH_TOKEN_FILE`| Yes | Path to the token JSON created by `--authorise` and transferred to the Pi.|
+|Variable        |   Required for OAuth | Description|
+|------------------------|----------------------|---------------------------------------------------------------------------|
+|`GMAIL_ACCOUNT` |                 Yes  | Personal Gmail address represented by the token.|
+|`GMAIL_OAUTH_TOKEN_FILE`|         Yes  | Path to the token JSON created by `--authorise` and transferred to the Pi.|
 
 
 ### Authorisation command options
 
-|Option            |   Required with `--authorise`| Description|
-|------------------|------------------|---------------|
-|`--authorise`     |              Yes | Starts personal Gmail OAuth authorisation.|
-|`--account`       |              Yes | Gmail address to authorise and verify.|
-|`--oauth-client-file` |          Yes | Downloaded Google OAuth Desktop client JSON.|
-|`--output`            |          Yes | Output token path. The token is written owner-only.|
+|  Option          | Required with `--authorise` |  Description   |
+|---------------------|-----------------------------|----------------------------------------------------|
+|`--authorise`     |                        Yes  | Starts personal Gmail OAuth authorisation.|
+|`--account`       |                        Yes  | Gmail address to authorise and verify.|
+|`--oauth-client-file`|                        Yes  | Downloaded Google OAuth Desktop client JSON.|
+|`--output`        |                        Yes  | Output token path. The token is written owner-only.|
 
 
 `--help` displays command usage without requiring any account
@@ -390,6 +384,9 @@ DB_LOCATION/<URL-encoded-email-address>/
     been implemented.
 -   A non-empty directory that is not a recognised complete repository
     is rejected.
+-   The current database/marker schema version is `2`. Version `1`
+    repositories are migrated to version `2` when opened; version `2`
+    repositories are used as-is. Other marker schema versions are rejected.
 -   A message is stored once, regardless of the number of Gmail labels
     attached to it.
 -   `ALL EMAIL` is a normal row in `folders`, not a virtual mailbox or
@@ -398,8 +395,12 @@ DB_LOCATION/<URL-encoded-email-address>/
 -   The importer creates `ALL EMAIL` when setting up a repository and
     backfills membership for all existing messages on the next run. This
     is idempotent and does not require downloading messages again.
--   Initial Gmail labels are mapped to local folders. Existing local
-    folder membership is not rewritten from later Gmail label changes.
+-   Gmail labels are recorded in source-side tables. During the initial
+    import, labels are mapped to local folders; newly imported messages
+    on later runs are also placed in folders for labels that already have
+    a local-folder mapping. For messages already stored locally, later
+    Gmail label changes refresh the source-side label snapshot only and
+    do not add or remove local folder memberships.
 -   Gmail deletions and label removals do not delete local files or
     remove `ALL EMAIL` membership.
 -   Only explicit local deletion removes a message from the repository;
@@ -446,24 +447,36 @@ importer does not push local changes to Gmail.
 
 ### Integrity checks and indexes
 
-Before a sync, the importer checks the repository's message-file
-integrity. The `ALL EMAIL` invariant is also checked: the folder must
-exist and every canonical message must have its membership row.
-Supporting SQLite indexes include `messages(shard_id)` and
-`gmail_labels(local_folder_id)`; index creation is idempotent.
+Before an incremental sync, the importer verifies that every database
+message has a corresponding file with the recorded size and SHA-256
+digest; it also rejects missing, untracked, temporary and interrupted
+message files. It checks that `ALL EMAIL` exists and every active message
+has its membership row, and reconciles the stored shard file counts with
+the database. Supporting SQLite indexes include `messages(shard_id)`
+and `gmail_labels(local_folder_id)`; index creation is idempotent.
 
 ## 8. Current implementation status
 
-The current importer includes both Workspace service-account
-authentication and personal Gmail OAuth, the persisted `ALL EMAIL`
-folder and automatic backfill, the supporting SQLite indexes,
-quota-aware retries, disk-space safeguards, and repository integrity
-checks.
+The attached importer source implements both Workspace service-account
+authentication and personal Gmail OAuth, persisted `ALL EMAIL` membership,
+source-side Gmail label tracking, sharded RFC 2822 message storage,
+repository integrity checks, adaptive Gmail API pacing/retries, and
+disk-space safeguards.
 
-The `ALL EMAIL` backfill and membership handling have been exercised
-with local SQLite tests, including repeat-run idempotency, membership on
-new import, and membership removal on explicit local deletion. The
-script has also passed Python syntax compilation.
+Normal imports perform a complete Gmail `messages.list` scan on every run.
+The importer does not use the Gmail History API and does not persist a
+history checkpoint. Existing messages are fetched in metadata format to
+refresh their Gmail label snapshot; raw message content is downloaded only
+for messages not already stored locally.
+
+The source file contains a `delete_local_message()` function for use by a
+local mail-store integration. The importer command-line interface itself
+currently exposes only normal import and personal OAuth authorisation; it
+does not expose a local-delete command.
+
+This README describes the implementation visible in the accompanying
+source file. It does not claim that a live end-to-end import against a
+particular Google account has been completed or validated.
 
 ## 9. Troubleshooting
 
@@ -585,31 +598,15 @@ integrity check, inspect it before proceeding.
 
 ### Exit codes
 
-  ---------------------------------------------------------------------
-                                     Code Meaning
-  --------------------------------------- -----------------------------
-                                      `0` Scan completed without
-                                          message failures
+| Code | Meaning|
+|----------| ---------------------------------------------------------------------|
+| `0`| Scan completed without message failures|
+| `1`| Scan completed, but one or more individual messages failed|
+| `2`| Configuration, authentication, repository or non-retryable API error|
+| `3`| Gmail quota/transient API errors persisted after retries; rerun later|
+| `4`| Insufficient disk space or filesystem full; free space and rerun|
+| `130`| User interrupted the importer with Ctrl-C; rerun to resume|
 
-                                      `1` Scan completed, but one or
-                                          more individual messages
-                                          failed
-
-                                      `2` Configuration,
-                                          authentication, repository or
-                                          non-retryable API error
-
-                                      `3` Gmail quota/transient API
-                                          errors persisted after
-                                          retries; rerun later
-
-                                      `4` Insufficient disk space or
-                                          filesystem full; free space
-                                          and rerun
-
-                                    `130` User interrupted the importer
-                                          with Ctrl-C; rerun to resume
-  ---------------------------------------------------------------------
 
 ### Repository integrity errors
 
@@ -621,17 +618,12 @@ backup if necessary.
 ## 10. Operational cautions
 
 -   Do not run two importer processes concurrently against the same
-    repository (i.e. email account).
+    repository.
 -   Keep service-account keys and OAuth token files outside the
     repository and source tree.
 -   Protect offline backups: they contain message contents and account
     metadata. Protect token files separately; the repository itself does
     not need the OAuth token to be readable.
--   Live end-to-end personal Gmail OAuth and full mailbox import have
-    not yet been validated in this environment. The source has been
-    syntax-checked and local retry/disk-safety helper tests have passed;
-    live validation must still be performed against the user's Google
-    Cloud OAuth client and account.
 
 ## 11. Google documentation
 

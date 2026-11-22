@@ -1,107 +1,99 @@
 # imap_archive_server
 
-A small, read-only IMAP server for browsing local mail repositories with an
-ordinary mail client such as Thunderbird. It serves repositories produced by
-either importer, side by side:
+A small, read-only IMAP server that lets you browse local mail archives using a
+normal mail client, such as Thunderbird. It is designed for a Raspberry Pi or
+another Linux computer on a trusted local network.
 
-- `gmail_local_repository_api.py` (`gmail-local-repository`, schema 2)
-- `imap_local_repository.py` (`imap-local-repository`, schema 1), for any
-  generic IMAP4 server
+## What the server does
 
-Each repository is one account; mix them freely in one `.ini`.
+- **Makes archived mail available over IMAP.** Connect with a mail client and
+  read messages and browse folders without running a full mail server such as
+  Dovecot.
+- **Supports multiple mailboxes.** Configure one account per repository. Each
+  login is isolated and can see only its own mailbox.
+- **Reads two repository types.** It supports Gmail API archives (schema
+  versions 2 and 3) and archives created by the generic IMAP importer (schema
+  version 1). You can use both types at the same time.
+- **Does not change your mail.** The server opens the archive database in
+  read-only query mode and refuses IMAP commands that would modify messages or
+  folders.
+- **Keeps message files intact.** It serves the stored message bytes rather
+  than rewriting the original message. It uses the recorded size for
+  `RFC822.SIZE`.
+- **Checks archive integrity.** It can check every message file against the
+  size and SHA-256 recorded in the repository. It can also check a message when
+  its raw bytes are first loaded by a client.
+- **Protects logins with password hashes.** Passwords are salted and hashed
+  with scrypt in a separate file; they are not stored in the `.ini` file.
+- **Can use encrypted connections.** Configure implicit TLS with a certificate
+  and private key. STARTTLS is not supported.
+- **Uses only Python's standard library.** There are no third-party packages
+  to install.
 
-It is intended to run on a Raspberry Pi (or any Linux box) on a trusted local
-network. It exists so you can **check, read and verify** the archived mail
-without running a full mail server such as Dovecot.
-
-- Single Python file, standard library only (no `pip install` needed).
-- Strictly read-only: it never writes to the repository, and refuses every
-  IMAP command that would modify mail.
-- Serves **several accounts**, each with its own login and its own repository.
-  A session can only ever see the account it signed in to.
-- Passwords are stored **salted and hashed** (scrypt) in a separate file, never
-  in the `.ini`.
-- Configured with one documented `.ini` file.
-- Can verify every message file against the size and SHA-256 recorded by the
-  importer.
+Each repository is one account. You can mix repository types freely in one
+configuration file.
 
 ## Contents
 
-- [What it does](#what-it-does)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
 - [Accounts and passwords](#accounts-and-passwords)
 - [Configuration](#configuration)
-- [Migrating from the single-account config](#migrating-from-the-single-account-config)
+- [Migrating from the older single-account configuration](#migrating-from-the-older-single-account-configuration)
 - [Command-line options](#command-line-options)
-- [Verifying the archive](#verifying-the-archive)
+- [Checking archive integrity](#checking-archive-integrity)
 - [Connecting a mail client](#connecting-a-mail-client)
 - [Enabling TLS](#enabling-tls)
-- [How the repository maps to IMAP](#how-the-repository-maps-to-imap)
+- [How folders and messages appear in IMAP](#how-folders-and-messages-appear-in-imap)
 - [Supported IMAP features](#supported-imap-features)
-- [Security notes](#security-notes)
+- [Security recommendations](#security-recommendations)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations](#known-limitations)
 - [Files](#files)
 
-## What it does
-
-The importer stores every Gmail message as one raw `.eml` file in a sharded
-folder tree and records metadata in `repository.db` (SQLite). This server reads
-that layout directly and presents it over IMAP:
-
-- Each account (one repository per mailbox) has its own login. After signing
-  in, the client sees only that account's mail.
-- Each local folder (created from a Gmail label during the initial import)
-  appears as an IMAP folder.
-- A message that carries several labels is stored once but appears in each of
-  its folders.
-- Read and starred state appear as the standard `\Seen` and `\Flagged` flags.
-- Message bytes are served **exactly as stored**, so a message downloaded
-  through IMAP hashes to the SHA-256 recorded in the database.
-- Messages are checked against their recorded size and hash the first time a
-  client opens them; a mismatch is logged as an error.
-- It can run alongside a Gmail sync: the database is opened read-only (SQLite
-  WAL mode lets readers and the importer's writer coexist).
-
 ## Requirements
 
-- Python 3.10 or later (developed on 3.12, run on 3.13). No third-party
-  packages.
-- Python built with OpenSSL (standard on Raspberry Pi OS), which provides
-  `hashlib.scrypt` for password hashing.
-- One or more repositories produced by `gmail_local_repository_api.py`
-  (`repository.json` schema version 2) or `imap_local_repository.py` (schema
-  version 1), each a directory containing `repository.json`, `repository.db`
-  and `messages/`.
-- Read access to that directory. SQLite may need to create or touch the
-  `repository.db-shm` / `-wal` helper files, so the user running the server
-  should normally have write access to the repository *directory* (the server
-  itself never writes data).
+- Python 3.10 or later. The server has been developed with Python 3.12 and run
+  with Python 3.13.
+- Python built with OpenSSL support, which provides `hashlib.scrypt` for
+  password hashing (standard on Raspberry Pi OS).
+- One or more repository directories containing `repository.json`,
+  `repository.db` and `messages/`:
+  - `gmail_local_repository_api.py` — application
+    `gmail-local-repository`, schema versions **2 and 3**.
+  - `imap_local_repository.py` — application `imap-local-repository`, schema
+    version **1**.
+- Read access to the repository files. Because the database uses SQLite WAL
+  mode, SQLite may need to create or update `repository.db-shm` and
+  `repository.db-wal` helper files. The server does not write mail or database
+  records, but the user running it will normally need write permission on the
+  repository directory for SQLite to manage those helper files.
 
 ## Quick start
 
 1. Copy `imap_archive_server.py` and `imap_archive_server.ini` into the same
-   folder, for example `/home/pi/`.
-2. Edit the `.ini` and define one `[account:LOGIN]` section per mailbox. For a
-   single mailbox:
+   directory, for example `/home/pi/`.
+2. Edit the `.ini` file and add one `[account:LOGIN]` section for each mailbox.
+   For one mailbox:
 
    ```ini
    [account:me]
    path = /home/pi/mail-data/you%40yourdomain.com
    ```
 
-   `LOGIN` is the username your mail client will use. It does not have to be
-   the real email address.
-3. Set that account's password (you are prompted twice; nothing is echoed):
+   `LOGIN` is the username you will enter in your mail client. It does not
+   have to be the mailbox's email address.
+3. Set a password for that account. You will be prompted twice; the password is
+   not echoed:
 
    ```bash
    python3 imap_archive_server.py --set-password me
    ```
 
-   This creates `imap_archive_server.passwd` beside the script, holding only a
-   salted hash. The password is for *this server*; it has nothing to do with
-   your Gmail or Workspace account.
+   This creates `imap_archive_server.passwd` beside the `.ini` file (unless
+   configured otherwise). It contains a salted hash, not the password. This is
+   a password for this server; it is unrelated to your Gmail or Workspace
+   password.
 4. Check the archive:
 
    ```bash
@@ -113,113 +105,131 @@ that layout directly and presents it over IMAP:
    python3 imap_archive_server.py
    ```
 
-   You should see lines such as:
+   Typical startup messages look like this:
 
-   ```
+   ```text
    INFO listening on 0.0.0.0:1143 (plaintext), 1 account(s)
    INFO account me: mailbox you@yourdomain.com, UIDVALIDITY 1793795584, 0 hidden-folder pattern(s)
    ```
-6. Point a mail client at it (see [Connecting a mail client](#connecting-a-mail-client)).
+6. Configure your mail client as described in [Connecting a mail client](#connecting-a-mail-client).
 
-Stop it with Ctrl-C or SIGTERM; it closes open connections and exits cleanly.
+Stop the server with Ctrl-C or SIGTERM. It closes open connections and exits
+cleanly.
 
 ## Accounts and passwords
 
-**One login per account.** Each `[account:LOGIN]` section in the `.ini` is one
-mailbox repository. The username a client signs in with selects the repository,
-and that session is bound to it for its whole life: there is no code path by
-which it can reach another account's folders or messages. Logins are
-case-insensitive and may not contain spaces or colons.
+### Accounts
 
-**Passwords are salted and hashed.** They are never in the `.ini`. Each account
-has one line in the password file (default `imap_archive_server.passwd`):
+Each `[account:LOGIN]` section represents one mailbox repository. The login
+selects the repository, and the session stays bound to that account for its
+lifetime. A session cannot browse another account's folders or messages.
 
-```
+- Logins are case-insensitive.
+- Logins may not contain spaces or colons.
+- Each account has one login and one password.
+- The server reads all configured accounts and validates their repositories at
+  startup. A bad account path or unsupported repository schema prevents startup
+  and identifies the account in the error.
+- The server refuses to start if a configured account has no password.
+
+### Password storage
+
+Passwords are stored in a separate file, never in the `.ini`. The default file
+is `imap_archive_server.passwd`, with one line per account. For example:
+
+```text
 # comments and blank lines are ignored
 alice:scrypt$32768$8$1$mLSK4xg0V_D-KlVdu3zstQ$HUGbr86lRbzuvmCX3Gq9vlqc...
-work:scrypt$32768$8$1$p__And7a0o5lJl1iVFlzmw$NzWKy8ymkDhvt-eHAdJC_2ec...
+work:scrypt$32768$8$1$p__And7a0o5lJl1iV1Flzmw$NzWKy8ymkDhvt-eHAdJC_2ec...
 ```
 
 The format is `login:scrypt$N$r$p$salt$hash`:
 
-- `scrypt` is a deliberately slow, memory-hungry password hash, from Python's
-  standard library.
-- `N`, `r`, `p` are the cost parameters (new hashes use 32768, 8, 1, roughly
-  32 MiB of memory and a fraction of a second per check). They are stored in
-  each line, so the cost can be raised later without invalidating old hashes.
-- `salt` is 16 random bytes generated for every password, and `hash` is the
-  32-byte result, both URL-safe base64 without padding.
+- `scrypt` is a deliberately slow, memory-intensive password hash provided by
+  Python's standard library.
+- New hashes use `N=32768`, `r=8`, `p=1` (roughly 32 MiB of memory per check).
+  The parameters are stored with each hash, so they can be changed for new
+  passwords without invalidating existing hashes.
+- Each password gets a fresh 16-byte random salt and a 32-byte hash. Both are
+  URL-safe base64 without padding.
 
-You don't write these lines by hand. Use:
+Use the command below to create or replace a password; do not edit hash lines
+by hand:
 
 ```bash
 python3 imap_archive_server.py --set-password LOGIN
 ```
 
-It prompts twice, then adds or replaces that login's line, keeping all other
-lines and comments. The file is written atomically with mode `600`. `LOGIN`
-must already have an `[account:LOGIN]` section. If standard input is not a
-terminal, the two passwords are read from standard input (one per line), which
-allows scripting:
+The login must already have a matching `[account:LOGIN]` section. The command
+prompts twice, then adds or replaces that login's line while keeping other
+lines and comments. It writes through a temporary file; ensure the resulting
+password file is protected with mode `600`:
+
+```bash
+chmod 600 imap_archive_server.passwd
+```
+
+If standard input is not a terminal, the two passwords are read from standard
+input, one per line. This allows scripting:
 
 ```bash
 printf 'the-password\nthe-password\n' | python3 imap_archive_server.py --set-password work
 ```
 
-(Typing a password literally like this stores it in your shell history, so
-prefer the interactive prompt unless you are scripting.)
+Typing a password literally in a shell command can leave it in shell history,
+so use the interactive prompt unless you are scripting in a suitably protected
+environment.
 
-Notes:
+Other password notes:
 
-- **Restart the server** after adding an account or changing a password. The
+- Restart the server after adding an account or changing a password. The
   password file is read at startup.
-- The server **refuses to start** if any configured account has no password,
-  and warns if the password file is readable by other users (`chmod 600` it) or
-  has entries for accounts that no longer exist.
-- **Forgotten password:** just run `--set-password` again. There is nothing to
-  recover, because only the hash is stored.
-- **Removing an account:** delete its `[account:...]` section and, optionally,
+- The server warns if the password file is readable by other users, or if it
+  contains entries for accounts that are no longer configured.
+- To change a forgotten password, run `--set-password` again. The original
+  password cannot be recovered because only its hash is stored.
+- To remove an account, delete its `[account:...]` section and, optionally,
   its line in the password file.
-- Hashes are checked off the main event loop, so a login never stalls other
-  clients, and at most two checks run at once so a flood of login attempts
-  cannot exhaust the Pi's memory.
+- Password checks run away from the main event loop, with at most two checks
+  running at once. This prevents slow password hashing from stalling other
+  clients and limits memory use during bursts of login attempts.
+- Unknown usernames go through the same password-hashing work as known users,
+  reducing the information exposed by login timing.
 
 ## Configuration
 
-All settings live in `imap_archive_server.ini`, which must sit **next to the
-script** unless you pass `--config`. The shipped file documents every option
-inline. This table is a summary.
+The default configuration file is `imap_archive_server.ini` beside the script.
+Use `--config PATH` to select another file. The shipped `.ini` documents the
+settings inline; the tables below summarise them.
 
-**Shared settings**
+### Shared settings
 
 | Section | Option | Default | Meaning |
-|---|---|---|---|
-| `[server]` | `host` | `0.0.0.0` | Listen address. `127.0.0.1` = this machine only; `::` = IPv6. |
-| | `port` | `1143` | TCP port (1-65535). Ports below 1024 need extra privileges. |
-| | `allow_networks` | empty | Comma-separated CIDR ranges allowed to connect, e.g. `192.168.0.0/16, 127.0.0.1/32`. Empty = no restriction. |
-| | `cache_messages` | `16` | Parsed messages cached per connection (1-10000). |
-| | `verify_on_read` | `true` | Check size and SHA-256 when a message is first opened. Mismatches are logged, not blocked. |
-| `[tls]` | `cert` | empty | PEM certificate. Setting it enables implicit TLS. Empty = plain IMAP. |
-| | `key` | empty | PEM private key; may be empty if it is in the certificate file. |
-| | `port` | empty | Port for TLS (for example `1993`). Empty = TLS is served on `[server] port`. Requires `cert`. |
+|---|---|---:|---|
+| `[server]` | `host` | `0.0.0.0` | Listen address. Use `127.0.0.1` for this computer only; `::` for IPv6. |
+| | `port` | `1143` | TCP port, from 1 to 65535. Ports below 1024 need extra privileges. |
+| | `allow_networks` | empty | Comma-separated CIDR ranges allowed to connect, e.g. `192.168.0.0/16, 127.0.0.1/32`. Empty means no network restriction. |
+| | `cache_messages` | `16` | Parsed messages cached per connection (1–10000). |
+| | `verify_on_read` | `true` | Check file size and SHA-256 when raw message bytes are first loaded. Mismatches are logged but the message is still served. |
+| `[tls]` | `cert` | empty | PEM certificate. Setting it enables implicit TLS. Empty means no TLS. |
+| | `key` | empty | PEM private key; may be empty if the key is included in the certificate file. |
+| | `port` | empty | Dedicated TLS port, e.g. `1993`. Requires `cert`. If empty, TLS (when enabled) uses `[server] port`. |
 | | `also_plain` | `false` | With `[tls] port` set, also open the unencrypted `[server] port`. |
-| `[auth]` | `password_file` | `imap_archive_server.passwd` | Hashed password file (see below). Relative paths are relative to the `.ini`. |
+| `[auth]` | `password_file` | `imap_archive_server.passwd` | Password-hash file. Relative paths are resolved against the `.ini` file. |
 | `[logging]` | `level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
-| | `file` | empty | Log to this file instead of the terminal. |
+| | `file` | empty | Write logs to this file instead of the terminal. |
 
-**Per-account settings**: one `[account:LOGIN]` section for each mailbox.
+### Per-account settings
+
+Add one `[account:LOGIN]` section per repository.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `path` | *required* | The repository directory (contains `repository.json`, `repository.db`, `messages/`). |
-| `uidvalidity` | `auto` | `auto` derives it from `created_at` in `repository.json`. Otherwise a fixed number from 1 to 4294967295. |
-| `hide_folders` | empty | Folder-name patterns to hide (`*`, `?`, `[seq]`; case-sensitive; comma- or newline-separated). Example: `CATEGORY_*, CHAT`. |
+| `path` | required | Repository directory containing `repository.json`, `repository.db` and `messages/`. |
+| `uidvalidity` | `auto` | Derive from `created_at` in `repository.json`, or set a fixed integer from 1 to 4294967295. |
+| `hide_folders` | empty | Case-sensitive shell-style folder patterns (`*`, `?`, `[seq]`), separated by commas or newlines. Example: `CATEGORY_*, CHAT`. |
 
-`hide_folders` uses shell-style patterns, so `[` starts a character class. To
-hide folders such as `[Gmail]/All Mail` or `[Gmail]/Spam`, write the bracket as
-`[[]`: `hide_folders = [[]Gmail]/All Mail, [[]Gmail]/Spam`.
-
-Example with two accounts (one Gmail API repository, one generic IMAP):
+Example with one Gmail API repository and one generic IMAP repository:
 
 ```ini
 [account:alice]
@@ -230,94 +240,115 @@ hide_folders = CATEGORY_*
 path = /home/pi/mail-data/work%40example.org
 ```
 
-For a repository created by `imap_local_repository.py`, `path` is the
-repository directory under its `DB_LOCATION` (the URL-encoded username, or the
-`IMAP_REPOSITORY_NAME` you set). Nothing else changes.
+For a repository created by `imap_local_repository.py`, `path` is the repository
+directory under its `DB_LOCATION` (the URL-encoded username, or the
+`IMAP_REPOSITORY_NAME` you configured).
 
-### Rules for the `.ini` file
+`hide_folders` uses shell-style patterns, where `[` starts a character class.
+To hide Gmail folders such as `[Gmail]/All Mail` or `[Gmail]/Spam`, escape the
+opening bracket with `[[]`:
 
-- Relative paths are resolved against the `.ini` file's folder; `~` is expanded.
-- Comments must be on their **own line** (starting with `#` or `;`). A comment
-  after a value becomes part of the value.
-- Lines that set an option must start in **column 1**. An indented line is
-  treated as a continuation of the previous option's value.
-- Unknown sections or option names stop the server at startup, so typos are
-  caught.
+```ini
+hide_folders = [[]Gmail]/All Mail, [[]Gmail]/Spam
+```
+
+### `.ini` file rules
+
+- Relative paths are resolved against the `.ini` file's directory; `~` is
+  expanded.
+- Comments must be on their own line, starting with `#` or `;`. A comment after
+  a setting becomes part of that setting's value.
+- Setting lines must start in column 1. An indented line is treated as a
+  continuation of the previous setting's value.
+- Unknown sections or option names stop startup, helping catch typos.
 - Invalid values produce an error naming the option and the value found.
 
-### Ports
+### Port choices
 
-The standard IMAP ports are 143 (plain) and 993 (implicit TLS), but binding
-ports below 1024 requires root or special capabilities. Using a high port such
-as 1143 (default) or 1993 avoids that. If you really want 993, a firewall
-redirect from 993 to your chosen port is safer than giving Python
-`cap_net_bind_service`, which applies to every Python script.
+The standard IMAP ports are 143 (plain) and 993 (implicit TLS), but binding a
+port below 1024 requires root or special capabilities. The default port 1143
+and an example TLS port 1993 avoid that requirement. If you want to use 993, a
+firewall redirect to a higher port is safer than giving Python
+`cap_net_bind_service`, which would apply to every Python script.
 
-## Migrating from the single-account config
+## Migrating from the older single-account configuration
 
-Earlier versions had one `[repository]` section, `[auth] user`, and an optional
-plaintext password (`password`, `password_file` or the `IMAP_PASSWORD`
-environment variable). That format is no longer accepted; the server prints an
-error pointing here. To migrate:
+Earlier versions used one `[repository]` section, `[auth] user`, and an
+optional plaintext password (`password`, `password_file` or the
+`IMAP_PASSWORD` environment variable). That configuration is no longer
+accepted. The server reports that the old format was found and points to this
+migration.
 
-1. Replace the `[repository]` section and `[auth] user`/`password` with one
-   account section, using your old username as the login:
+Replace the old settings with an account section and a hashed password file.
+For example:
 
-   ```ini
-   # before
-   [repository]
-   path = /home/pi/mail-data/you%40yourdomain.com
-   hide_folders = CATEGORY_*
-   uidvalidity = auto
-   [auth]
-   user = me
-   password_file = /home/pi/.imap_password
+```ini
+# before
+[repository]
+path = /home/pi/mail-data/you%40yourdomain.com
+hide_folders = CATEGORY_*
+uidvalidity = auto
+[auth]
+user = me
+password_file = /home/pi/.imap_password
 
-   # after
-   [account:me]
-   path = /home/pi/mail-data/you%40yourdomain.com
-   hide_folders = CATEGORY_*
-   uidvalidity = auto
-   [auth]
-   password_file = imap_archive_server.passwd
-   ```
-2. Run `python3 imap_archive_server.py --set-password me` and enter the
-   password. You can reuse the old one.
-3. Delete the old plaintext password file and stop using `IMAP_PASSWORD`;
-   neither is read any more.
+# after
+[account:me]
+path = /home/pi/mail-data/you%40yourdomain.com
+hide_folders = CATEGORY_*
+uidvalidity = auto
+[auth]
+password_file = imap_archive_server.passwd
+```
 
-`UIDVALIDITY`, UIDs and folders are unchanged, so existing client caches stay
-valid.
+Then:
+
+1. Run `python3 imap_archive_server.py --set-password me` and enter the
+   password. You may reuse the old password.
+2. Delete the old plaintext password file and stop setting `IMAP_PASSWORD`;
+   neither is read by the current server.
+3. Restart the server.
+
+The account's UIDs and folders are unchanged. `UIDVALIDITY` is unchanged if
+you retain the same repository and setting, so existing client caches should
+remain valid.
 
 ## Command-line options
 
-```
+```text
 imap_archive_server.py [--config PATH] [--set-password LOGIN]
                        [--verify [--account LOGIN]] [-v]
 ```
 
 | Option | Meaning |
 |---|---|
-| `--config PATH` | Use a different `.ini` file (default: `imap_archive_server.ini` beside the script). |
-| `--set-password LOGIN` | Create or change an account's password, then exit. |
-| `--verify` | Check every message file of every account against the database, print problems, and exit. |
-| `--account LOGIN` | With `--verify`: check only this account. |
-| `-v`, `--verbose` | Debug logging (overrides `level` in the `.ini`). |
+| `--config PATH` | Use a different `.ini` file. The default is `imap_archive_server.ini` beside the script. |
+| `--set-password LOGIN` | Create or change an account password, then exit. |
+| `--verify` | Check every message file in every configured account, print any problems, then exit. |
+| `--account LOGIN` | With `--verify`, check only this account. |
+| `-v`, `--verbose` | Enable debug logging, overriding `level` in the `.ini`. |
 
-Exit codes: `--verify` returns 0 if all files check out and 1 if any problem is
-found. Configuration and repository errors print a message and exit non-zero.
+For `--verify`, exit status is 0 if all checked files pass and 1 if any
+problem is found. Configuration and repository errors also exit non-zero.
 
-## Verifying the archive
+## Checking archive integrity
+
+Run:
 
 ```bash
 python3 imap_archive_server.py --verify
 ```
 
-For every message in every account's repository (including folders hidden
-from clients) this checks that the file exists, that its size matches `message_size`, and
-that its SHA-256 matches `sha256`. Example output:
+The check covers every message in every configured repository, including
+messages in folders hidden from mail clients. For each message it checks that:
 
-```
+- The message file exists.
+- Its size matches `message_size` in the database.
+- Its SHA-256 matches `sha256` in the database.
+
+Example output:
+
+```text
 == alice (alice@example.com) ==
 SIZE      18c0a1  /home/pi/mail-data/.../messages/000001/18c0a1.eml: file 208 != db 206
 MISSING   18c0a3  /home/pi/mail-data/.../messages/000001/18c0a3.eml: No such file or directory
@@ -326,53 +357,65 @@ checked 3 messages, 2 problem(s)
 checked 1204 messages, 0 problem(s)
 ```
 
-Use `--account LOGIN` to check a single account.
+Use `--account LOGIN` to check one account only. In the report, Gmail
+repositories identify messages by Gmail ID; generic IMAP repositories identify
+them by SHA-256.
 
-This is a file-level integrity check against what the importer recorded. It
-cannot tell you whether Gmail's raw representation matches the original SMTP
-message (Google does not guarantee that), only that your stored files have not
-changed since import.
+This is a file-level check against the values recorded by the importer. It
+cannot establish whether Gmail's stored raw representation is identical to the
+original SMTP message; Google does not guarantee that. It tells you whether the
+local files still match what the importer recorded.
 
-While the server runs, `verify_on_read` performs the same check on each message
-a client opens and logs `INTEGRITY MISMATCH` if it fails.
+### Checks while the server is running
+
+With `verify_on_read = true` (the default), the server checks a message's size
+and SHA-256 when it first loads that message's raw bytes for a connection. A
+metadata-only request, such as fetching `UID`, `FLAGS`, `INTERNALDATE` or
+`RFC822.SIZE`, does not by itself load the file and therefore may not trigger
+the check. Once loaded, the parsed message is cached for that connection.
+
+If a mismatch is found, the server logs `INTEGRITY MISMATCH` but still serves
+the message. This lets you inspect a damaged message rather than having it
+hidden from the mail client.
 
 ## Connecting a mail client
 
-Thunderbird cannot auto-discover a private server, so choose **Configure
-manually** and enter:
+Thunderbird cannot automatically discover a private server, so choose
+**Configure manually** and enter:
 
 | Field | Value |
 |---|---|
 | Protocol | IMAP |
-| Server | Pi's IP address or hostname (e.g. `192.168.1.50`) |
-| Port | `1143` (or your configured port) |
-| Connection security | None (or SSL/TLS if you configured `[tls]`) |
+| Server | The Pi's IP address or hostname, e.g. `192.168.1.50` |
+| Port | `1143`, or the port you configured |
+| Connection security | None for plaintext, or SSL/TLS if you enabled TLS |
 | Authentication | Normal password |
-| Username / password | the account's `LOGIN` and the password you set with `--set-password` |
+| Username / password | The account's `LOGIN` and the password set with `--set-password` |
 
-Use a separate Thunderbird account for each login; each one shows only its own
-mailbox. The email address you give Thunderbird can be anything; it only labels
-the account. This server
-cannot send mail. If the wizard insists on an outgoing (SMTP) server, enter a
-placeholder such as `localhost`, port 25; you can delete it afterwards. With
-connection security "None", Thunderbird shows an "unencrypted" warning that you
-must acknowledge.
+Use a separate mail-client account for each server login; each one displays
+only its own mailbox. The email address entered in the client is only a label
+and does not have to match the login. This server cannot send mail. If the
+setup wizard insists on an outgoing SMTP server, enter a placeholder such as
+`localhost` on port 25; you can remove it afterwards.
 
-Quick connectivity test from another machine:
+With connection security set to None, Thunderbird displays an unencrypted
+connection warning that you must acknowledge.
+
+You can test a plaintext connection from another machine with:
 
 ```bash
 nc -v 192.168.1.50 1143
-# expect: * OK [CAPABILITY IMAP4rev1] archive server ready
-# type:   a1 LOGOUT
+# Expect: * OK [CAPABILITY IMAP4rev1] archive server ready
+# Then type: a1 LOGOUT
 ```
 
-Thunderbird is the client this has been used with. Other clients (Apple Mail,
-iOS Mail, Outlook) have not been tested; some are stricter about unencrypted
+Thunderbird is the client used with this server. Apple Mail, iOS Mail and
+Outlook have not been tested. Some clients are stricter about unencrypted
 logins, so TLS is recommended for them.
 
 ## Enabling TLS
 
-On a LAN a self-signed certificate is fine:
+A self-signed certificate is suitable for a trusted home LAN. For example:
 
 ```bash
 openssl req -x509 -newkey rsa:3072 -nodes -days 3650 \
@@ -381,7 +424,7 @@ openssl req -x509 -newkey rsa:3072 -nodes -days 3650 \
 chmod 600 imap.key
 ```
 
-Then in the `.ini`:
+Add the certificate and key to the `.ini`:
 
 ```ini
 [tls]
@@ -389,7 +432,8 @@ cert = /home/pi/imap.crt
 key = /home/pi/imap.key
 ```
 
-To carry TLS on its own port (the usual unprivileged substitute for 993), add:
+By default, the `[server] port` now carries implicit TLS. To use a separate
+TLS port (for example, 1993), configure:
 
 ```ini
 [tls]
@@ -398,142 +442,197 @@ key = /home/pi/imap.key
 port = 1993
 ```
 
-The server then listens for TLS on 1993 and does **not** open the unencrypted
-`[server] port`. Set `also_plain = true` if you also want the plaintext port
-(for example 1143) open at the same time. Without `[tls] port`, the `[server]
-port` itself carries TLS when a certificate is set, as in earlier versions.
+With this configuration, the server listens for TLS on port 1993 and does not
+open the unencrypted `[server] port`. To run both listeners, add:
 
-Setting a certificate enables **implicit TLS** (like port 993). Set the client's connection
-security to "SSL/TLS", not "STARTTLS". The server does not implement STARTTLS.
-Thunderbird will ask you to accept the self-signed certificate on first
-connect.
+```ini
+also_plain = true
+```
 
-## How the repository maps to IMAP
+When `also_plain = true`, the TLS listener uses `[tls] port` and the plaintext
+listener uses `[server] port`. The two ports must be different.
 
-| IMAP concept | Source |
+This is **implicit TLS**, like standard IMAP port 993. In your mail client,
+choose **SSL/TLS**, not STARTTLS. STARTTLS is not implemented. Thunderbird may
+ask you to accept the self-signed certificate the first time it connects.
+
+## How folders and messages appear in IMAP
+
+The server reads repository metadata and message files and presents them using
+these mappings:
+
+| IMAP item | Repository source |
 |---|---|
-| Account | `[account:LOGIN]` section; the login name selects the repository |
-| Folder list | `folders.name` (hidden by `hide_folders` if matched) |
+| Account | `[account:LOGIN]` section; the login selects the repository |
+| Folder list | `folders.name`, except names matched by `hide_folders` |
 | Folder contents | `folder_messages` joined to `messages` |
 | Message UID | `messages.message_id` |
-| UIDVALIDITY | `repository.json` `created_at` as a Unix timestamp (or the configured value) |
+| UIDVALIDITY | `created_at` in `repository.json` as a Unix timestamp, or the configured `uidvalidity` value |
 | `\Seen` | `messages.is_read` |
 | `\Flagged` | `messages.is_starred` |
-| Internal date | `messages.internal_date` (epoch ms/s or ISO 8601), falling back to `imported_at` |
+| Internal date | `messages.internal_date` (epoch milliseconds, epoch seconds or ISO 8601), falling back to `imported_at` |
 | `RFC822.SIZE` | `messages.message_size` |
-| Message content | `messages/<shard directory>/<filename>` |
+| Message bytes | `messages/<shard directory>/<filename>` |
 
-Notes:
+Additional details:
 
-- For IMAP repositories, folders are the IMAP folders the importer copied
-  (`INBOX`, `Sent`, `Spam`, ...), shown by their decoded names. `--verify`
-  labels each message by its SHA-256 instead of a Gmail ID.
-- Folders include whatever the importer created from Gmail labels, which may
-  include system labels such as Spam, Trash, Starred or category labels. Use
-  `hide_folders` to hide ones you don't want to see.
-- Folder names are shown with `/` as the hierarchy delimiter. Non-ASCII names
-  are encoded as IMAP modified UTF-7, as clients expect.
-- A folder's contents are read from the database each time a client selects
-  it. Mail imported while a client is connected appears after the client
+- In Gmail repositories, folders reflect the folders created from Gmail labels.
+  A message with several labels is stored once but appears in each matching
+  folder. Depending on the archive, folders may include system labels such as
+  Spam, Trash, Starred or category labels; use `hide_folders` to hide unwanted
+  ones.
+- In generic IMAP repositories, folders are the IMAP folders copied by the
+  importer (for example `INBOX`, `Sent` or `Spam`), shown using their decoded
+  names.
+- Folder names use `/` as the hierarchy delimiter. Non-ASCII names are encoded
+  as IMAP modified UTF-7 for clients.
+- Parent folders are not automatically created for names containing `/`. For
+  example, a label named `Projects/Travel` does not cause a synthetic `Projects`
+  folder to be added. Some clients may therefore display such folder trees
+  imperfectly.
+- Folder contents are read from the database whenever a client selects the
+  folder. Mail imported while a client is connected appears after it
   re-selects the folder or reconnects.
+- `UIDVALIDITY` is automatically derived from the whole-second timestamp in
+  `created_at`. Two repositories created in the same second can therefore have
+  the same value; it is not guaranteed to be globally unique. You can set an
+  explicit value per account if needed.
+- Message IDs are used directly as IMAP UIDs. The server does not validate
+  that repository IDs fit IMAP's 32-bit UID range; compatible repository data
+  is expected to satisfy that requirement.
 
 ## Supported IMAP features
 
-**Commands:** `CAPABILITY`, `NOOP`, `LOGOUT`, `LOGIN`, `LIST`, `LSUB`,
-`SUBSCRIBE`/`UNSUBSCRIBE` (accepted, no effect), `STATUS`, `SELECT`, `EXAMINE`
-(both open read-only), `CLOSE`, `UNSELECT`, `CHECK`, `FETCH`, `SEARCH`,
-`UID FETCH`, `UID SEARCH`.
+### Commands
 
-**FETCH items:** `UID`, `FLAGS`, `INTERNALDATE`, `RFC822.SIZE`, `ENVELOPE`,
-`BODYSTRUCTURE`, `BODY`, `RFC822`, `RFC822.HEADER`, `RFC822.TEXT`, and
-`BODY[...]` / `BODY.PEEK[...]` with `HEADER`, `HEADER.FIELDS`,
-`HEADER.FIELDS.NOT`, `TEXT`, `MIME`, numbered parts such as `1.2`, and partial
-ranges (`<0.2048>`). Macros `ALL`, `FAST`, `FULL`.
+The server supports:
 
-**SEARCH keys:** `ALL`, `SEEN`/`UNSEEN`, `ANSWERED`/`UNANSWERED`,
-`FLAGGED`/`UNFLAGGED`, `DELETED`/`UNDELETED`, `DRAFT`/`UNDRAFT`, `FROM`, `TO`,
+`CAPABILITY`, `NOOP`, `LOGOUT`, `LOGIN`, `LIST`, `LSUB`, `SUBSCRIBE`,
+`UNSUBSCRIBE`, `STATUS`, `SELECT`, `EXAMINE`, `CLOSE`, `UNSELECT`, `CHECK`,
+`FETCH`, `SEARCH`, `UID FETCH` and `UID SEARCH`.
+
+`SELECT` and `EXAMINE` both open folders read-only. `SUBSCRIBE` and
+`UNSUBSCRIBE` are accepted but have no effect; there is no stored subscription
+list. `LSUB` simply returns the same folder listing as `LIST`.
+
+### FETCH data
+
+Supported items include `UID`, `FLAGS`, `INTERNALDATE`, `RFC822.SIZE`,
+`ENVELOPE`, `BODYSTRUCTURE`, `BODY`, `RFC822`, `RFC822.HEADER`, `RFC822.TEXT`
+and `BODY[...]` / `BODY.PEEK[...]` sections, including:
+
+- `HEADER`
+- `HEADER.FIELDS` and `HEADER.FIELDS.NOT`
+- `TEXT` and `MIME`
+- Numbered parts such as `1.2`
+- Partial ranges such as `<0.2048>`
+- The `ALL`, `FAST` and `FULL` macros
+
+### SEARCH keys
+
+Supported search keys include:
+
+`ALL`, `SEEN` / `UNSEEN`, `ANSWERED` / `UNANSWERED`, `FLAGGED` /
+`UNFLAGGED`, `DELETED` / `UNDELETED`, `DRAFT` / `UNDRAFT`, `FROM`, `TO`,
 `CC`, `BCC`, `SUBJECT`, `HEADER`, `BODY`, `TEXT`, `SINCE`, `BEFORE`, `ON`,
-`LARGER`, `SMALLER`, `UID`, message-number sets, `NOT`, `OR`, and parenthesised
-groups. Header searches match decoded (MIME-decoded) text; `BODY`/`TEXT`
-search the decoded text parts. Date searches use the internal date.
+`LARGER`, `SMALLER`, `UID`, message-number sets, `NOT`, `OR` and parenthesised
+groups.
 
-**Refused with `NO [READ-ONLY]`:** `STORE`, `COPY`, `EXPUNGE`, `APPEND`,
-`CREATE`, `DELETE`, `RENAME`, and their `UID` forms.
+Header searches match decoded (MIME-decoded) text. `BODY` and `TEXT` search
+decoded text parts. Date searches use the internal date.
 
-**Not implemented:** `STARTTLS`, `AUTHENTICATE`, `IDLE`, `NAMESPACE`,
-`SORT`/`THREAD`, `ENABLE`, `UIDPLUS`, `SENTSINCE`-style date searches, mailbox
-special-use attributes. The server advertises only `IMAP4rev1`, and clients
-fall back gracefully.
+Searches that need to inspect message content process messages in short time
+slices, allowing other client connections to run between slices. If a client
+disconnects during a long search, the server stops work for that search.
 
-## Security notes
+### Commands refused or not implemented
 
-- The server is **read-only**. It opens each database with
-  `PRAGMA query_only=ON` and has no code path that writes to a repository.
-- **Account isolation:** a session is bound to one account at login and only
-  holds that account's backend.
-- **Passwords** are stored as salted scrypt hashes and compared in constant
-  time. Logins for unknown users do the same amount of work as real ones, so
-  timing does not reveal which logins exist. A failed login is delayed by a
-  second and a connection is closed after three failures; there is no
-  per-address lockout, so use `allow_networks` or a firewall as well.
-- By default traffic is **unencrypted**, including the password the client
-  sends. That is acceptable on a trusted home LAN but enable TLS if you are
-  unsure.
-- Use `allow_networks` and/or a firewall to keep the port off untrusted
-  networks. Do not expose the port to the internet.
-- The archives contain personal mail. Keep the password file and TLS key
-  `chmod 600`, and keep the repositories themselves protected.
+The server refuses commands that would change mail or folders, returning
+`NO [READ-ONLY]`. These include `STORE`, `COPY`, `EXPUNGE`, `APPEND`, `CREATE`,
+`DELETE`, `RENAME` and their `UID` forms.
+
+Not implemented: `STARTTLS`, `AUTHENTICATE`, `IDLE`, `NAMESPACE`,
+`SORT` / `THREAD`, `ENABLE`, `UIDPLUS`, `SENTSINCE`-style date searches and
+mailbox special-use attributes. The server advertises only `IMAP4rev1`.
+
+## Security recommendations
+
+- **Keep it on a trusted network.** By default, the server listens on all
+  interfaces and uses plaintext IMAP. Do not expose it directly to the
+  internet. Use `allow_networks`, a firewall, or both to restrict access.
+- **Enable TLS when needed.** Without TLS, passwords and mail cross the network
+  unencrypted. The server supports implicit TLS, not STARTTLS.
+- **Protect the password file and private key.** Use file permissions such as
+  `chmod 600 imap_archive_server.passwd` and `chmod 600 imap.key`.
+- **Protect the archive directory.** The repository contains personal mail.
+- **Remember the server is read-only, not a backup tool.** It does not modify
+  repository content, but it also does not replace a separate backup.
+
+The server opens each repository database with `PRAGMA query_only=ON`. It does
+not issue database writes. Passwords are compared in constant time; unknown
+logins perform equivalent hashing work. Failed logins are delayed by about one
+second, and a connection is closed after three failed attempts. There is no
+per-address lockout, so network restrictions and firewall rules are still
+important.
 
 ## Troubleshooting
 
 | Symptom | Likely cause and fix |
 |---|---|
 | `[server] port must be an integer, got '1143   # ...'` | A comment follows the value. Move the comment to its own line. |
-| `... got '1143\n\nallow_networks = ...'` | The next option line starts with spaces. Remove the leading spaces so it starts in column 1. |
-| `unknown option 'xxx' in [server]` | Misspelled option name. Compare against the shipped `.ini`. |
-| `cannot read .../repository.json` | The account's `path` is wrong. It must be the mailbox directory itself, e.g. `.../mail-data/you%40yourdomain.com`. |
-| `unrecognised repository application` / `schema_version ... is not supported` | The directory is not a Gmail (schema 2) or IMAP (schema 1) repository, or was made by a newer importer. |
-| Thunderbird: "failed to find the settings" | Expected. Use **Configure manually**. |
-| Connection refused / times out | Server not running, `host` set to `127.0.0.1`, wrong port, or firewall. |
-| Connects, then drops immediately | Log shows `rejected connection ... (not in allow_networks)`. Add your client's network. |
-| Login rejected | Check the username (an `[account:...]` login, not your email address unless you named it that) and password. Look for `failed login for ...` in the log. |
-| `no password set for: ...` at startup | Run `--set-password LOGIN` for each account listed. |
-| `this is the old single-account format` | See [Migrating](#migrating-from-the-single-account-config). |
-| `password file ... malformed password hash` / `expected 'login:hash'` | The password file contains something other than hashes (for example an old plaintext password). Replace it using `--set-password`. |
-| Password change has no effect | The password file is read at startup; restart the server. |
-| `too many failed login attempts` | The client sent three bad logins on one connection. Fix the password in the client. |
-| Binding port fails (permission) | Ports below 1024 need privileges; use 1143 or a redirect. |
-| Log: `INTEGRITY MISMATCH` | A message file differs from the importer's recorded size/SHA-256. Run `--verify` and compare with a backup. |
-| Log: `LF-only line endings` | A stored message lacks CRLF line endings; some clients may misparse it. |
-| All message dates look like the import date | `internal_date` is in an unrecognised format and the server fell back to `imported_at`. |
-| Database errors about `-shm`/`-wal` | The user running the server needs write access to the repository directory so SQLite can open the WAL database. |
+| `... got '1143\n\nallow_networks = ...'` | The next option line is indented. Remove leading spaces so it starts in column 1. |
+| `unknown option 'xxx' in [server]` | The option name is misspelled. Compare it with the shipped `.ini`. |
+| `cannot read .../repository.json` | The account's `path` is wrong. It must point to the mailbox repository directory itself. |
+| `unrecognised repository application` / `schema_version ... is not supported` | The directory is not a supported Gmail schema 2 or 3 repository, or generic IMAP schema 1 repository, or it was created by a newer importer. |
+| Thunderbird: “failed to find the settings” | Expected for a private server. Choose **Configure manually**. |
+| Connection refused or times out | The server may not be running; `host` may be `127.0.0.1`; the port may be wrong; or a firewall may block it. |
+| Connects, then drops immediately | Check the log for `rejected connection ... (not in allow_networks)`. Add the client's network to `allow_networks`. |
+| Login rejected | Check the `[account:...]` login and password. The login is not necessarily the email address. Look for `failed login for ...` in the log. |
+| `no password set for: ...` at startup | Run `--set-password LOGIN` for each listed account. |
+| `this is the old single-account format` | Follow [the migration instructions](#migrating-from-the-older-single-account-configuration). |
+| `password file ... malformed password hash` / `expected 'login:hash'` | The password file contains an invalid line or an old plaintext password. Replace it using `--set-password`. |
+| Password change has no effect | The password file is read at startup. Restart the server. |
+| `too many failed login attempts` | The client sent three incorrect logins on one connection. Correct the saved password in the client. |
+| Binding a port fails with a permission error | Ports below 1024 need privileges. Use 1143 or a firewall redirect. |
+| Log: `INTEGRITY MISMATCH` | A message file differs from the recorded size or SHA-256. Run `--verify` and compare with a backup. |
+| Log: `LF-only line endings` | A stored message has LF-only line endings. Some clients may misparse it; the server still serves the original bytes. |
+| Message dates look like the import date | `internal_date` may be in an unrecognised format, so the server fell back to `imported_at`. |
+| SQLite errors mention `-shm` or `-wal` | The server user needs write permission on the repository directory so SQLite can manage WAL helper files. |
 
-Run with `-v` to log connections and debugging detail.
+Run with `-v` to enable connection and debugging details.
 
 ## Known limitations
 
-- New messages imported during a client session appear only after the client
-  re-selects the folder (no push updates, no `IDLE`).
-- The first open of a very large folder can be slow, because clients request
-  `ENVELOPE` and `BODYSTRUCTURE` for every message and each is parsed from its
-  file. Parsed results are not persisted between runs.
-- `message/rfc822` attachments are returned whole; their inner parts cannot be
-  addressed separately.
-- Headers of nested MIME parts (`BODY[2.MIME]`) are regenerated by Python's
-  `email` library and may differ in line folding from the original bytes.
-  Top-level headers and bodies are the stored bytes.
-- Gmail labels with `/` in the name show as slash-delimited folders, but parent
-  folders are not synthesised, so some clients display the tree oddly.
-- Each account has exactly one login and one password. The password file is
-  read at startup only (restart to change it).
-- Only Thunderbird has been used against it so far.
+- New messages imported while a client is connected appear only after the
+  client re-selects the folder or reconnects. There are no push updates and no
+  `IDLE` support.
+- Opening a very large folder for the first time can be slow. Mail clients
+  commonly request `ENVELOPE` and `BODYSTRUCTURE` for every message, and the
+  server parses those from the message files. Parsed results are cached per
+  connection, not persisted between server runs.
+- `message/rfc822` attachments are returned as whole message parts. Numeric
+  part paths can descend into an embedded message when Python's email parser
+  exposes it as a multipart payload; behavior depends on how the message is
+  represented by the parser.
+- Headers of nested MIME parts (for example `BODY[2.MIME]`) are regenerated by
+  Python's `email` library and may differ in line folding from the original
+  bytes. Top-level headers and message bodies are served from the stored bytes.
+- Gmail labels containing `/` appear as slash-delimited folder names, but
+  parent folders are not synthesised. Some clients may display the hierarchy
+  oddly.
+- There is no persistent subscription list. `SUBSCRIBE` and `UNSUBSCRIBE` do
+  nothing, and `LSUB` mirrors `LIST`.
+- Each account has exactly one login and one password. Password changes take
+  effect after a server restart.
+- Only Thunderbird has been used with this server so far; other clients have
+  not been tested.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `imap_archive_server.py` | The server (single file, standard library only). |
-| `imap_archive_server.ini` | Configuration, with every option documented. |
-| `imap_archive_server.passwd` | Created by `--set-password`: salted password hashes, one line per account. Keep it `chmod 600`. |
-| `README.md` | This document. |
-| `AGENTS.md` | Technical context and design decisions for developers and coding agents. |
+| `imap_archive_server.py` | The server (one Python file, standard library only). |
+| `imap_archive_server.ini` | Configuration file, with settings documented inline. |
+| `imap_archive_server.passwd` | Created by `--set-password`; stores salted password hashes, one line per account. Protect it with `chmod 600`. |
+| `README.md` | This user guide. |
+| `AGENTS.md` | Developer notes, implementation details and design decisions. |

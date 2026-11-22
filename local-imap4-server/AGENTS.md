@@ -29,9 +29,11 @@ what has and has not been tested. User-facing documentation is in `README.md`.
 
 ## 2. The data source (not part of this repo)
 
-The archive is produced by a separate importer, `gmail_local_repository_api.py`
-(README supplied by the owner, which supersedes an older `imap_sync.py`). Facts
-about it that matter here:
+The archive is produced by separate importers. The details below about
+import-time behavior, Gmail API acquisition, deletion policy, sharding and WAL
+writer settings are historical context supplied by the owner; they are **not
+verifiable from `imap_archive_server.py` alone**. The server-side compatibility
+contract is documented separately below:
 
 - One physical raw `.eml` per Gmail message (Gmail API `format="raw"`,
   base64url-decoded, **not** re-encoded). Google does not guarantee these bytes
@@ -118,8 +120,10 @@ the code self-contained. The hard parts are FETCH (`BODY[...]` section grammar,
 `BODYSTRUCTURE`) and SEARCH (recursive criteria).
 
 ### UID = `messages.message_id`
-- It is an integer, increases in import order, fits IMAP's 32-bit UID range,
-  and needs no extra storage or sync logic.
+- It is an integer used directly as the IMAP UID. The current server does not
+  validate that repository `message_id` values fit IMAP's 32-bit UID range;
+  that is an importer/data invariant, not enforced here. No extra storage or
+  sync logic is needed.
 - Gmail IDs (`gm_id`) are 64-bit hex strings and cannot be UIDs.
 - Same message in two folders -> same UID in each (UIDs are per-folder
   namespaces, so this is legal).
@@ -135,11 +139,12 @@ the code self-contained. The hard parts are FETCH (`BODY[...]` section grammar,
   next-UID counter.
 
 ### UIDVALIDITY derived from `repository.json` `created_at`
-Stable for the repository's life, unique per repository, and fits 32 bits (a 2026
-Unix timestamp is ~1.79e9; the limit is 4.29e9, i.e. until 2106). Can be
-overridden in the `.ini`. The server also refuses to start unless
-`application == "gmail-local-repository"` and `schema_version == 2`, so a schema
-change fails loudly instead of returning wrong data.
+Stable for the repository's life and fits 32 bits (a 2026 Unix timestamp is
+~1.79e9; the limit is 4.29e9, i.e. until 2106). It is derived from the
+whole-second Unix timestamp, so it is **not guaranteed unique** if two
+repositories have the same `created_at` second. Can be overridden in the `.ini`. The server validates the repository's
+application and schema against `SUPPORTED_REPOSITORIES` at startup, so
+unsupported versions fail loudly instead of returning wrong data.
 
 ### Bytes served exactly as stored (no line-ending normalisation)
 An early version converted LF to CRLF on read. That was **removed**: the database
@@ -160,9 +165,12 @@ come from the raw bytes. Don't "fix" the top level to use the parsed form.
 ### Integrity checking
 - `--verify`: standalone check of every message (existence, size, SHA-256),
   including folders hidden from clients; exit code 1 on any problem.
-- `verify_on_read` (default true): the same check the first time a client opens
-  a message. On mismatch it **logs an ERROR but still serves the message**, so
-  damaged mail can be inspected instead of disappearing.
+- `verify_on_read` (default true): the check runs when `loaded(m)` first loads
+  the raw message bytes for a connection (then the parsed result is cached).
+  Metadata-only FETCH items such as `UID`, `FLAGS`, `INTERNALDATE` and
+  `RFC822.SIZE` do not by themselves load the file or trigger this check. On
+  mismatch it **logs an ERROR but still serves the message**, so damaged mail
+  can be inspected instead of disappearing.
 - This verifies local files against what the importer recorded. It cannot show
   that Gmail's raw form equals the original SMTP message.
 
@@ -202,8 +210,9 @@ the backend (so hidden folders are also unselectable), but not in `--verify`.
   add features that look across accounts (for example a combined search).
 - Per-account settings are `path`, `uidvalidity`, `hide_folders`. Shared settings
   (server, TLS, logging, password file) stay global. Each account's
-  `UIDVALIDITY` auto-derives from its own `repository.json`, so accounts get
-  different values.
+  `UIDVALIDITY` auto-derives from its own `repository.json`; values are usually
+  distinct but can collide when repositories share the same creation timestamp
+  to whole-second precision.
 - All accounts are opened and validated at startup (`build_accounts`), so a bad
   path fails immediately with an error prefixed `[account:NAME]`, not at first
   login. Account names are lowercased; client logins are matched
@@ -313,8 +322,9 @@ protection).
   tolerated.
 - `section_data()` regex handles `HEADER`, `HEADER.FIELDS[.NOT] (...)`, `TEXT`,
   `MIME`, numeric paths, and the empty section. Numeric paths use `get_part()`,
-  which treats a non-multipart message as having a single part `1`. A
-  `message/rfc822` part is returned whole and cannot be descended into.
+  which treats a non-multipart message as having a single part `1`. The Python
+  email parser exposes an embedded `message/rfc822` message as a multipart
+  payload, so numeric paths can descend into its embedded parts.
 - `BODYSTRUCTURE` is built recursively; `message/rfc822` parts include the inner
   envelope and structure. Extension data (disposition, language) is included for
   `BODYSTRUCTURE`, omitted for `BODY`.
@@ -329,6 +339,14 @@ protection).
 - `RECENT` is always 0; `UNSEEN` is not sent in the `SELECT` response.
 - Per-connection cache: an `OrderedDict` of parsed messages, size
   `cache_messages`. `msg_size()` returns the DB value and never reads the file.
+
+- `SEARCH` yields to the event loop after at most `SEARCH_SLICE_SECONDS` (0.05 s)
+  of work so other connections/accounts can run. After yielding it checks
+  `reader.at_eof()`; if the client disconnected during a long search, `ClientGone`
+  stops processing quietly.
+- `SUBSCRIBE` and `UNSUBSCRIBE` are accepted after authentication but do not
+  persist or alter anything. `LSUB` simply runs the same folder listing logic as
+  `LIST`; there is no subscription store or subscription filtering.
 
 ## 6. Testing
 
@@ -412,12 +430,13 @@ scripted `imaplib` suite as `tests/`.
 
 ## Supporting both importers (added)
 
-The backend accepts two repository types, listed in `SUPPORTED_REPOSITORIES`
-(`application` -> allowed `schema_version` values):
+The backend accepts two repository applications, listed in
+`SUPPORTED_REPOSITORIES` (`application` -> allowed `schema_version` values):
 
-- `gmail-local-repository`, schema 2 (Gmail API importer; messages keyed by `gm_id`)
-- `imap-local-repository`, schema 1 (generic IMAP importer; messages keyed by
-  the SHA-256 of their bytes, no `gm_id`)
+- `gmail-local-repository`, schema **2 or 3** (Gmail API importer; messages
+  identified in verification output by `gm_id`)
+- `imap-local-repository`, schema **1** (generic IMAP importer; messages
+  identified in verification output by SHA-256, with no `gm_id`)
 
 Both provide the columns the server reads: `folders.name`, `folder_messages`,
 `messages(message_id, filename, message_size, sha256, internal_date,
