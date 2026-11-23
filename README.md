@@ -4,6 +4,8 @@ A one-way Gmail-to-local repository importer. Gmail is the acquisition
 source; the local repository is intended to remain usable independently
 of Gmail.
 
+For regular IMAP servers and Outlook.com email accounts, see [imap-sync](https://github.com/brentengelbrecht/imap-sync).
+
 This version supports two ways to authenticate to the Gmail API:
 
 -   **Google Workspace:** service account with domain-wide delegation.
