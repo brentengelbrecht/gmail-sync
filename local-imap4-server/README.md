@@ -49,11 +49,12 @@ configuration file.
 - [Security recommendations](#security-recommendations)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations](#known-limitations)
+- [Tests](#tests)
 - [Files](#files)
 
 ## Requirements
 
-- Python 3.10 or later. The server has been developed with Python 3.12 and run
+- Python 3.11 or later. The server has been developed with Python 3.12 and run
   with Python 3.13.
 - Python built with OpenSSL support, which provides `hashlib.scrypt` for
   password hashing (standard on Raspberry Pi OS).
@@ -211,6 +212,9 @@ settings inline; the tables below summarise them.
 | | `allow_networks` | empty | Comma-separated CIDR ranges allowed to connect, e.g. `192.168.0.0/16, 127.0.0.1/32`. Empty means no network restriction. |
 | | `cache_messages` | `16` | Parsed messages cached per connection (1–10000). |
 | | `verify_on_read` | `true` | Check file size and SHA-256 when raw message bytes are first loaded. Mismatches are logged but the message is still served. |
+| | `login_timeout` | `120` | Seconds a new connection has to log in, counted from when it connects (0 to 86400; 0 = no limit). |
+| | `idle_timeout` | `1800` | Seconds a logged-in client may send nothing before it is disconnected with `* BYE Autologout` (0 to 86400; 0 = no limit). |
+| | `max_connections` | `100` | Most simultaneous connections (0 to 100000; 0 = no limit). Extra connections receive `* BYE Too many connections`. |
 | `[tls]` | `cert` | empty | PEM certificate. Setting it enables implicit TLS. Empty means no TLS. |
 | | `key` | empty | PEM private key; may be empty if the key is included in the certificate file. |
 | | `port` | empty | Dedicated TLS port, e.g. `1993`. Requires `cert`. If empty, TLS (when enabled) uses `[server] port`. |
@@ -601,11 +605,56 @@ important.
 
 Run with `-v` to enable connection and debugging details.
 
+### Limits and timeouts
+
+The server protects itself against clients that stall, misbehave or flood it:
+
+- **Login deadline.** A connection that has not logged in within `login_timeout`
+  seconds receives `* BYE Autologout; login timed out` and is closed.
+- **Idle timeout.** A logged-in client that sends no command for `idle_timeout`
+  seconds receives `* BYE Autologout; idle for too long`. Only time spent waiting
+  for the client counts; a long-running `SEARCH` or `FETCH` never trips it. This
+  also applies while the server waits for the rest of a command, such as a
+  literal that never arrives.
+- **Slow readers.** A client that stops reading the server's replies for two
+  minutes is disconnected, so a stuck client cannot hold a connection (and the
+  data queued for it) forever.
+- **Connection limit.** When `max_connections` is reached, new connections are
+  refused with `* BYE Too many connections`; existing ones are unaffected.
+- **Oversized input.** A command line longer than 64 KiB closes that connection
+  (`* BYE command line too long`). A client literal larger than 10 MB is
+  refused: a normal `{n}` literal gets a tagged `NO [TOOBIG]` and the connection
+  carries on; a `{n+}` literal, which the client is already sending, closes it.
+  Other connections are never affected.
+
+### One busy client does not slow the others
+
+Reading message files, parsing them and querying SQLite happen on a small pool
+of worker threads, in slices of about 50 ms, and results are sent after each
+slice. A client that fetches thousands of envelopes, or runs a body search over
+a big folder, therefore does not stop other clients (or other accounts) from
+being served. On a Raspberry Pi the total work is of course still limited by its
+CPU, so a heavy request may make everything somewhat slower, but not unresponsive.
+
+Log files do not contain command arguments. If a command fails unexpectedly,
+only its tag and command name are logged, never a password.
+
 ## Known limitations
 
+- **The repository must not be replaced or rebuilt while the server is running.**
+  The importer may keep adding or updating messages (new mail appears after a
+  client re-selects the folder), but `repository.json`, `repository.db` and the
+  `messages/` tree must stay the same repository for as long as the server runs.
+  The server relies on message ids staying valid as UIDs and on the repository's
+  creation time staying constant (it is the source of UIDVALIDITY). If you
+  rebuild, restore from backup or swap in a different copy, stop the server
+  first, then start it again.
 - New messages imported while a client is connected appear only after the
   client re-selects the folder or reconnects. There are no push updates and no
   `IDLE` support.
+- Python's global interpreter lock means the worker threads share one CPU core
+  for parsing. Other clients stay responsive, but heavy parsing is not
+  parallelised across cores.
 - Opening a very large folder for the first time can be slow. Mail clients
   commonly request `ENVELOPE` and `BODYSTRUCTURE` for every message, and the
   server parses those from the message files. Parsed results are cached per
@@ -627,6 +676,36 @@ Run with `-v` to enable connection and debugging details.
 - Only Thunderbird has been used with this server so far; other clients have
   not been tested.
 
+## Tests
+
+The `tests/` folder holds an automated test suite (Python standard library only,
+plus the `openssl` command for the TLS tests, which are skipped if it is missing).
+It builds small synthetic repositories in a temporary directory, starts the real
+server as a subprocess and talks to it over real sockets. Nothing outside the
+temporary directory is touched.
+
+```bash
+python3 -m unittest discover -s tests -v     # about 30-45 seconds
+python3 -m unittest tests.test_server.ProtocolTests    # one group only
+```
+
+The suite covers the read-only protocol (LIST, STATUS, SELECT, FETCH sections,
+SEARCH keys, refusals), authentication, account isolation, timeouts and limits,
+oversized or garbage input, damaged archives (`--verify`, `INTEGRITY MISMATCH`),
+implicit TLS, clean shutdown, and responsiveness of other clients while one
+client runs a heavy FETCH or SEARCH.
+
+To check that a change did not alter any reply, compare the new script with an
+earlier copy. Both servers receive the same ~130 commands and every difference
+is printed:
+
+```bash
+python3 tests/compare_servers.py /path/to/old/imap_archive_server.py
+```
+
+Set `ARCHIVE_SERVER=/path/to/imap_archive_server.py` to run the test suite against
+a different copy of the script.
+
 ## Files
 
 | File | Purpose |
@@ -634,5 +713,7 @@ Run with `-v` to enable connection and debugging details.
 | `imap_archive_server.py` | The server (one Python file, standard library only). |
 | `imap_archive_server.ini` | Configuration file, with settings documented inline. |
 | `imap_archive_server.passwd` | Created by `--set-password`; stores salted password hashes, one line per account. Protect it with `chmod 600`. |
+| `tools/inspect_repository.py` | Read-only report on a repository: how Gmail IDs and thread IDs are stored, and an estimate of disk space for optional future state files. |
+| `tests/` | Automated tests (`test_server.py`), the synthetic-repository builder, and `compare_servers.py`. |
 | `README.md` | This user guide. |
 | `AGENTS.md` | Developer notes, implementation details and design decisions. |

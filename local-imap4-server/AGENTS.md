@@ -26,6 +26,15 @@ what has and has not been tested. User-facing documentation is in `README.md`.
   Development/testing was done on Python 3.12.
 - Only Thunderbird has been used by the owner (it "works well"). Apple Mail,
   iOS Mail and others are untested.
+- **Owner decision (2026-11-25): the only client that must work is the owner's
+  own web client** ("OWC", a separate project that reads this archive). Every
+  other client (iOS Mail, Outlook, Apple Mail, Thunderbird, Android) is "nice to
+  have": compatibility work for them is lower priority than anything the web
+  client needs. When in doubt about a protocol feature, ask what the web client
+  sends; the planned statistics counters (commands by name) would show that.
+- **Python 3.11 is the minimum version** (owner decision, 2026-11-25), which gives
+  the simple `StreamWriter.start_tls` for a future STARTTLS. Only 3.12 has been
+  used for testing here.
 
 ## 2. The data source (not part of this repo)
 
@@ -183,6 +192,17 @@ sync. Because of WAL, the process needs write permission on the repository
 **directory** even though it writes no data. A fresh connection is made for each
 `folders()`/`load()` call (cheap, and keeps results current).
 
+### Repository lifetime assumption
+The repository is **never replaced, rebuilt or restored while the server is
+running** (owner confirmation, 2026-11-25). The importer may add or update rows
+and files while the server runs (WAL), but `repository.json` (so UIDVALIDITY),
+the identity of `repository.db` and the `messages/` tree are constant for a
+server run. Several decisions rely on this: UID = `message_id`, a per-account
+constant UIDVALIDITY, and any future live-update or change-log code, which does
+**not** need to detect or survive a rebuild. This is also documented for users in
+README.md ("Known limitations"). If the owner ever needs hot rebuilds, revisit
+UIDVALIDITY handling first.
+
 ### Folder snapshot semantics
 `SELECT` loads the folder once into `self.msgs` for the session. There is no
 refresh on `NOOP`/`CHECK` and no `* n EXISTS` push, so mail imported mid-session
@@ -302,6 +322,44 @@ session would otherwise hang shutdown. This was added after the owner saw a
 `KeyboardInterrupt` traceback on Ctrl-C, and it also makes `systemctl stop`
 (SIGTERM) behave.
 
+### Concurrency model (event loop + worker threads)
+- The protocol layer is asyncio, but everything that blocks (SQLite queries in `folders()`/`load()`,
+  reading message files, `email` parsing, SEARCH predicates) runs on a dedicated
+  `ThreadPoolExecutor(WORKER_THREADS=4)` through `Session._run()`. Before this, one client's
+  `FETCH 1:* (ENVELOPE BODYSTRUCTURE)` froze every other connection for its whole duration
+  (measured: 2.4 s worst-case NOOP latency for another client on 3,000 messages; now ~15 ms).
+- Long jobs run in slices (`FETCH_SLICE_SECONDS`, `SEARCH_SLICE_SECONDS`, 50 ms; FETCH also stops a
+  slice at `FETCH_SLICE_BYTES`). After each slice the results are sent from the event loop, so
+  memory per slice stays small, back-pressure (`drain`) applies between slices, and a vanished
+  client is noticed. Metadata-only FETCH (`UID FLAGS INTERNALDATE RFC822.SIZE`, `LIGHT_ITEMS`)
+  needs no file and stays on the loop, yielding between slices.
+- **Thread-safety rule:** a session processes one command at a time and never shares state with
+  another session, so a session's `msgs`/`cache` are only touched by one thread at a time. Do not
+  introduce shared mutable state between sessions, and do not start a second concurrent job in the
+  same session (no pipelined execution of commands) without revisiting this. `ArchiveBackend` opens a
+  fresh SQLite connection per call inside the worker thread, so it needs no locking.
+- Password hashing keeps using the loop's default executor behind `auth_gate` (2 at a time). It is a
+  separate pool on purpose, so a login flood cannot starve readers and vice versa.
+- The GIL still serialises pure-Python parsing, so this gives fairness, not parallel speed-up. Real
+  multi-core use would need processes, which is not worth it for this workload.
+- A FETCH error (for example a missing file) stops the slice; responses built before the failing
+  message are sent first and the error is raised afterwards, exactly as the old one-message loop behaved.
+
+### Timeouts and resource limits
+- `[server] login_timeout` (default 120 s) is one absolute deadline for logging in, measured from the
+  connection. `idle_timeout` (default 1800 s, the RFC 3501 minimum) applies between commands once
+  logged in. Both wrap `read_command()` in `asyncio.wait_for`, so a literal that never completes is
+  covered as well. Time spent *executing* a command is never counted. 0 disables either.
+- `send()` bounds `drain()` with `WRITE_TIMEOUT` (120 s) and raises `ConnectionError` for a client that
+  stops reading. `max_connections` (default 100) rejects extra connections with `* BYE`.
+- Input limits: command line up to the StreamReader limit (64 KiB); `MAX_LITERAL` / `MAX_COMMAND_BYTES`
+  (10 MB). An over-long line or an oversized `{n+}` literal is fatal (`* BYE`, bounded
+  `_discard_input()` so the close does not reset the connection and lose the BYE). An oversized
+  synchronising `{n}` literal gets a tagged `NO [TOOBIG]` *without* sending `+`, which keeps the
+  connection in sync.
+- Logging: `command_label()` (tag and command name only) is the only part of a command line that may be
+  logged, because a LOGIN line contains the password. Keep it that way.
+
 ### Read-only invariant
 Every mutating command (`STORE`, `COPY`, `EXPUNGE`, `APPEND`, `CREATE`,
 `DELETE`, `RENAME`, and the `UID` forms) returns `NO [READ-ONLY]`. `SELECT`
@@ -337,57 +395,54 @@ protection).
 - Unknown commands return `BAD`; a missing file during FETCH returns
   `NO <strerror>` and logs, rather than crashing the connection.
 - `RECENT` is always 0; `UNSEEN` is not sent in the `SELECT` response.
-- Per-connection cache: an `OrderedDict` of parsed messages, size
+- Per-connection cache: an `OrderedDict` of parsed messages (least recently used evicted), size
   `cache_messages`. `msg_size()` returns the DB value and never reads the file.
 
-- `SEARCH` yields to the event loop after at most `SEARCH_SLICE_SECONDS` (0.05 s)
-  of work so other connections/accounts can run. After yielding it checks
-  `reader.at_eof()`; if the client disconnected during a long search, `ClientGone`
-  stops processing quietly.
+- `SEARCH` evaluates its predicate on a worker thread, `SEARCH_SLICE_SECONDS` (0.05 s) at a time (see
+  "Concurrency model"). Between slices it checks `reader.at_eof()`; if the client disconnected during a
+  long search, `ClientGone` stops processing quietly.
+- `SEARCH HEADER name ""` (and `FROM`/`TO`/`SUBJECT ""`) matches only messages that *have* the header
+  (RFC 3501); before, it matched every message.
 - `SUBSCRIBE` and `UNSUBSCRIBE` are accepted after authentication but do not
   persist or alter anything. `LSUB` simply runs the same folder listing logic as
   `LIST`; there is no subscription store or subscription filtering.
 
 ## 6. Testing
 
-There is no test suite in the repository. Testing so far was done in a sandbox
-with a **synthetic repository** built from the owner's exact `CREATE TABLE`
-statements plus `repository.json`, and Python's `imaplib` as the client:
+Run `python3 -m unittest discover -s tests -v` (about 30-45 s). Details:
 
-- messages in two folders; one with a multipart/alternative + attachment; a
-  non-ASCII folder name (`Réunions/2023`); a non-ASCII subject and sender;
-  an `internal_date` as epoch ms, as ISO 8601, and as junk (fallback);
-  files stored with CRLF.
-- Multi-account tests used two synthetic repositories with different mailboxes,
-  folder sets and `created_at` values. Verified: each login sees only its own
-  folders and UIDs; selecting the other account's folder returns `NO`; fetching
-  the other account's UID returns nothing; wrong/cross/unknown logins are
-  rejected after about 1 s; 3 failures close the connection; `LOGIN` after
-  authentication is `BAD`; commands before login are refused (checked over a raw
-  socket, because `imaplib` blocks those client-side); a password sent as an IMAP
-  literal works; six concurrent logins across both accounts overlap; case-
-  insensitive login; `--set-password` (new, replace, mismatch, unknown account),
-  preservation of other lines, mode 600; startup refusal with a missing password,
-  a malformed hash line, and the old single-account config; `--verify` for all
-  accounts and with `--account`.
-- Verified: `LIST`, `STATUS`, `SELECT`, `UID FETCH` of flags/size/date/envelope/
-  structure/partial/sub-parts, `BODY[]` SHA-256 equals the database value,
-  `SEARCH` variants, refusal of `STORE`, bad login, `hide_folders`,
-  `allow_networks` rejection, password precedence, config validation errors,
-  `--verify` on clean and corrupted/missing files, `INTEGRITY MISMATCH` logging,
-  and clean SIGINT/SIGTERM shutdown with a connected client.
+- `tests/repo_factory.py` builds synthetic repositories from the importers' table layout (Gmail schema 2
+  and generic-IMAP schema 1) in a temp directory. `tests/harness.py` starts the server as a subprocess
+  from a generated `.ini` and provides a raw-socket IMAP client (literals included). Everything is
+  black-box through the real command line, config and sockets. `ARCHIVE_SERVER=path` runs the suite
+  against another copy of the script.
+- `tests/test_server.py` groups: `ProtocolTests` (LIST/STATUS/SELECT/FETCH sections/SEARCH keys/refusals,
+  byte-exact `BODY[]`, characterisation of multipart sub-parts), `AuthTests`, `RobustnessTests`
+  (login/idle timeouts, connection limit, over-long lines, oversized literals, garbage, abrupt
+  disconnects), `DamagedArchiveTests` (missing/corrupt files, `--verify`), `TlsTests` (implicit TLS,
+  needs the `openssl` command), `ShutdownTests` (SIGTERM idle and mid-FETCH), `ConcurrencyTests`
+  (another client's NOOP latency while a big FETCH/SEARCH runs, 3,000 messages), `UnitTests`.
+- `tests/compare_servers.py OLD.py [NEW.py]` sends ~130 commands to two versions of the script over the
+  same repository and prints every reply that differs. Run it before and after any refactoring of the
+  protocol or MIME code; it is the main safety net for "don't change behaviour" work. The only known
+  intended difference from the pre-test-suite version is the empty-string `HEADER` search fix.
+- The latency tests assert generous bounds (worst NOOP latency under 0.5 s) so they should not be flaky
+  on a Pi, but they are timing-based; if one fails on slow hardware, look at the printed numbers first.
+- `run_server_test.py` (older) needs the importer modules and a fake IMAP server that are not in this
+  repository; it is kept as an end-to-end smoke test for the owner's full tool chain.
+
+Still not covered: Apple/iOS/Outlook clients, STARTTLS (not implemented), very large repositories (100k+
+messages), running against a live importer, and non-CPython interpreters. Only Python 3.12 has been used
+for testing; Python 3.11 is the required minimum (section 1). The code does not
+yet refuse to start on older versions; adding that check is part of the next
+protocol work.
 
 Gotchas for writing tests:
 
 - `imaplib.IMAP4.select()` raises when the server returns `[READ-ONLY]`; call
-  `select(name, readonly=True)`.
-- Use a real Thunderbird session for anything client-specific; `imaplib` is
-  much more forgiving.
-- Not covered: very large repositories, concurrent clients, Apple/iOS/Outlook
-  clients, TLS handshake with real clients, running against a live importer.
-
-A reasonable next step is to commit the synthetic-repository generator and a
-scripted `imaplib` suite as `tests/`.
+  `select(name, readonly=True)`. `imaplib` is much more forgiving than real clients, which is why the
+  suite mostly uses the raw client.
+- Use a real Thunderbird session for anything client-specific.
 
 ## 7. Known gaps / backlog (rough priority)
 
@@ -403,6 +458,9 @@ scripted `imaplib` suite as `tests/`.
    time).
 2c. Optional `SIGHUP` reload of the password file and account list.
 3. Refresh on `NOOP`/`CHECK` with `EXISTS` for live-sync visibility.
+3b. Byte-offset MIME scanner (slice `BODY[n]`, `BODY[n.MIME]` and `BODYSTRUCTURE` sizes from the stored
+   bytes instead of regenerating them through `email`). Pin behaviour with `compare_servers.py` first;
+   `BODY[n.HEADER]`/`BODY[n.TEXT]` of an embedded `message/rfc822` part are also still wrong.
 4. Confirm the `internal_date` format against real data and simplify
    `parse_date()`.
 5. STARTTLS, `NAMESPACE`, `IDLE` (only if some client needs them).
@@ -413,7 +471,30 @@ scripted `imaplib` suite as `tests/`.
    design for where local flags/folder changes are stored without fighting the
    importer.
 
+### Decisions already made about the backlog (owner, 2026-11-25)
+- The web client is the only required client; priorities follow from that
+  (performance, correct MIME parts and robustness before compatibility).
+- Python 3.11 minimum.
+- Text matching (SEARCH, and later SORT/THREAD and any full-text index) may be
+  **English-only for now**, but must be written so other languages can be added:
+  route every case-folding, normalisation and base-subject (`Re:`/`Fwd:`) decision
+  through one small "text rules" object selected by a `search_language` option
+  (only `en` accepted today), instead of scattering `.lower()` calls. Anything
+  persisted (metadata cache, full-text index) must record which rules built it so
+  a language change forces a rebuild.
+- Live updates (`NOOP`/`IDLE` refresh) are **off by default**; when enabled the
+  refresh interval is configurable in the `.ini`.
+- A future `state_dir` may live on an SD card or an SSD; use
+  `tools/inspect_repository.py` to estimate its size for a real archive.
+- Not yet decided: whether the metadata cache should default to on.
+
 ## 8. Conventions for changes
+
+- Run the test suite, and `tests/compare_servers.py` against the previous copy of the script, before
+  and after a change. New behaviour needs a test; a deliberate change to a reply needs an entry in
+  section 6's "intended differences".
+- Blocking work (disk, SQLite, MIME parsing) must go through `Session._run()`; never call it directly
+  from a `cmd_*` handler.
 
 - Keep standard library only and a single file unless there is a strong reason.
 - Never open `repository.db` writable and never modify repository files.

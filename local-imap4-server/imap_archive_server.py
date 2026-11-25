@@ -47,6 +47,7 @@ import ssl
 import sys
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -216,15 +217,34 @@ def verify(backend):
 # Helpers
 # ============================================================================
 class Err(Exception):
-    def __init__(self, status, text):
-        self.status, self.text = status, text
+    """A command failed. `tag` (when set) addresses the reply to a command whose line could not
+    be fully read; `fatal` means the connection cannot continue in sync and must be closed."""
+
+    def __init__(self, status, text, tag=None, fatal=False):
+        self.status, self.text, self.tag, self.fatal = status, text, tag, fatal
 
 
-SEARCH_SLICE_SECONDS = 0.05   # longest a SEARCH may run before other connections get a turn
+# Work that touches disk, SQLite or the MIME parser runs on worker threads (see Session._run) so
+# that one client's big FETCH, SEARCH or SELECT cannot stall every other connection. Long jobs
+# are cut into slices of about this many seconds, so a client that disconnects (or a server
+# that is shutting down) is noticed promptly and memory per slice stays small.
+SEARCH_SLICE_SECONDS = 0.05
+FETCH_SLICE_SECONDS = 0.05
+FETCH_SLICE_BYTES = 1 << 20   # ... or this many bytes of FETCH output, whichever comes first
+WORKER_THREADS = 4            # threads for disk/SQLite/MIME work (password hashing has its own)
+MAX_LITERAL = 10_000_000      # largest single client literal
+MAX_COMMAND_BYTES = 10_000_000  # largest whole command, literals included
+WRITE_TIMEOUT = 120           # drop a client that has not read what we sent for this long
 
 
 class ClientGone(Exception):
     """The client disconnected while a long command was running; stop quietly."""
+
+
+def command_label(line):
+    """'TAG COMMAND' from a command line: safe to log. Never include the arguments; a LOGIN
+    line carries the password."""
+    return " ".join(line.split(None, 2)[:2])
 
 
 def crlf(b):
@@ -655,10 +675,11 @@ MACROS = {"ALL": ["FLAGS", "INTERNALDATE", "RFC822.SIZE", "ENVELOPE"],
 
 
 class Session:
-    def __init__(self, reader, writer, accounts, cfg, auth_gate, dummy_hash):
+    def __init__(self, reader, writer, accounts, cfg, auth_gate, dummy_hash, executor=None):
         self.reader, self.writer = reader, writer
         self.accounts, self.cfg = accounts, cfg
         self.auth_gate, self.dummy_hash = auth_gate, dummy_hash
+        self.executor = executor        # worker threads for blocking work; None = loop default
         self.peer = (writer.get_extra_info("peername") or ("?",))[0]
         self.account = self.backend = None   # bound at LOGIN: a session sees one account only
         self.failed_logins = 0
@@ -670,34 +691,100 @@ class Session:
     # ---- I/O ---------------------------------------------------------------
     async def send(self, *parts):
         self.writer.write(b"".join(p if isinstance(p, bytes) else p.encode() for p in parts))
-        await self.writer.drain()
+        try:
+            await asyncio.wait_for(self.writer.drain(), WRITE_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise ConnectionError("client stopped reading")
+
+    async def _run(self, fn, *args):
+        """Run blocking work (SQLite, file reads, MIME parsing) on a worker thread.
+
+        A session handles one command at a time, so its state (self.msgs, self.cache) is only
+        ever touched by one thread at a time; sessions never share state with each other.
+        """
+        return await asyncio.get_running_loop().run_in_executor(self.executor, fn, *args)
+
+    async def _bye(self, text):
+        self.closing = True
+        try:
+            await self.send(f"* BYE {text}\r\n")
+        except (ConnectionError, OSError):
+            pass
+
+    async def _discard_input(self, seconds=2.0, limit=1 << 20):
+        """Read and drop what the client is still sending, so that closing does not reset the
+        connection (a reset can destroy the BYE we just sent). Bounded in time and size."""
+        end, got = time.monotonic() + seconds, 0
+        try:
+            while got < limit:
+                left = end - time.monotonic()
+                if left <= 0:
+                    break
+                chunk = await asyncio.wait_for(self.reader.read(65536), left)
+                if not chunk:
+                    break
+                got += len(chunk)
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            pass
+
+    async def _readline(self):
+        try:
+            return await self.reader.readline()
+        except (ValueError, asyncio.LimitOverrunError):     # line longer than the stream limit
+            raise Err("BAD", "command line too long", fatal=True)
 
     async def read_command(self):
-        line = await self.reader.readline()
+        line = await self._readline()
         if not line:
             return None
         line = line.decode("utf-8", "replace").rstrip("\r\n")
+        total = len(line)
         while True:  # fold client literals into quoted strings
             m = re.search(r"\{(\d+)(\+?)\}$", line)
             if not m:
                 return line
-            n = int(m.group(1))
-            if n > 10_000_000:
-                raise Err("BAD", "literal too large")
-            if not m.group(2):
+            n, nonsync = int(m.group(1)), bool(m.group(2))
+            total += n
+            if n > MAX_LITERAL or total > MAX_COMMAND_BYTES:
+                # A synchronising literal has not been invited yet, so refusing it keeps the
+                # connection in sync. A {n+} literal is already on its way: give up the connection.
+                words = line.split(None, 1)
+                raise Err("NO", "[TOOBIG] literal too large", tag=words[0] if words else "*",
+                          fatal=nonsync)
+            if not nonsync:
                 await self.send(b"+ ready\r\n")
             data = (await self.reader.readexactly(n)).decode("utf-8", "replace")
-            rest = (await self.reader.readline()).decode("utf-8", "replace").rstrip("\r\n")
+            rest = (await self._readline()).decode("utf-8", "replace").rstrip("\r\n")
             line = line[:m.start()] + '"' + data.replace("\\", "\\\\").replace('"', '\\"') + '"' + rest
 
+    def _read_timeout(self, started):
+        """Seconds the next command may take to arrive; None = no limit.
+
+        Before login this is one overall deadline for the whole login (so a client cannot
+        hold a connection open by trickling NOOPs); afterwards it is an idle timeout.
+        """
+        if self.state == "nonauth":
+            t = self.cfg.login_timeout
+            return max(0.001, started + t - time.monotonic()) if t else None
+        return self.cfg.idle_timeout or None
+
     async def run(self):
-        await self.send(b"* OK [CAPABILITY IMAP4rev1] archive server ready\r\n")
+        started = time.monotonic()
         try:
+            await self.send(b"* OK [CAPABILITY IMAP4rev1] archive server ready\r\n")
             while not self.closing:
                 try:
-                    line = await self.read_command()
+                    line = await asyncio.wait_for(self.read_command(), self._read_timeout(started))
+                except asyncio.TimeoutError:
+                    await self._bye("Autologout; idle for too long" if self.state != "nonauth"
+                                    else "Autologout; login timed out")
+                    break
                 except Err as e:
-                    await self.send(f"* {e.status} {e.text}\r\n")
+                    if e.fatal:
+                        await self._bye(e.text)
+                        await self._discard_input()
+                        break
+                    await self.send(f"{e.tag or '*'} {e.status} {e.text}\r\n")
                     continue
                 if line is None:
                     break
@@ -718,14 +805,21 @@ class Session:
                     await self.send(f"{tag} {e.status} {e.text}\r\n")
                 except (ValueError, IndexError):
                     await self.send(f"{tag} BAD invalid arguments\r\n")
+                except ConnectionError:
+                    break
                 except OSError as e:
                     log.warning("file error: %s", e)
                     await self.send(f"{tag} NO {e.strerror or 'file error'}\r\n")
                 except Exception:
-                    log.exception("command failed: %s", line[:80])
+                    # Never log the command line itself: for LOGIN it contains the password.
+                    log.exception("command failed: %s", command_label(line))
                     await self.send(f"{tag} NO internal error\r\n")
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("session from %s ended unexpectedly", self.peer)
         finally:
             self.writer.close()
 
@@ -785,7 +879,7 @@ class Session:
         rx = re.compile("^" + "".join(
             ".*" if c == "*" else "[^/]*" if c == "%" else re.escape(c)
             for c in ref + pat) + "$")
-        for f in self.backend.folders():
+        for f in await self._run(self.backend.folders):
             enc = utf7_encode(f)
             if rx.match(enc):
                 await self.send(f"* {kw} () \"/\" ".encode() + q(enc) + b"\r\n")
@@ -805,7 +899,7 @@ class Session:
         self.need_auth()
         name, items = a[0], a[1]
         try:
-            uv, msgs = self.backend.load(utf7_decode(name))
+            uv, msgs = await self._run(self.backend.load, utf7_decode(name))
         except KeyError:
             raise Err("NO", "no such mailbox")
         out = []
@@ -828,7 +922,7 @@ class Session:
         self.state, self.msgs, self.folder = "auth", [], None
         self.cache.clear()
         try:
-            uv, msgs = self.backend.load(utf7_decode(a[0]))
+            uv, msgs = await self._run(self.backend.load, utf7_decode(a[0]))
         except KeyError:
             raise Err("NO", "no such mailbox")
         self.state, self.msgs, self.folder = "selected", msgs, a[0]
@@ -864,7 +958,9 @@ class Session:
     # ---- selected: FETCH / SEARCH -----------------------------------------
     def loaded(self, m):
         L = self.cache.get(m.uid)
-        if L is None:
+        if L is not None:
+            self.cache.move_to_end(m.uid)
+        else:
             raw = load_raw(m.path)
             if self.cfg.verify_on_read and (len(raw) != m.size or
                     hashlib.sha256(raw).hexdigest() != m.sha256.lower()):
@@ -911,6 +1007,32 @@ class Session:
             label += f"<{o}>"
         return label.encode() + b" {%d}\r\n" % len(d) + d
 
+    # FETCH items answered from the database row alone: no file is read, no MIME parsing.
+    LIGHT_ITEMS = frozenset({"UID", "FLAGS", "INTERNALDATE", "RFC822.SIZE"})
+
+    def _fetch_chunk(self, targets, pos, items):
+        """Build FETCH responses for targets[pos:] for about FETCH_SLICE_SECONDS.
+
+        Returns (responses, next_pos, error). An error stops the chunk; the caller sends the
+        responses built so far and then raises it, as a one-message-at-a-time loop would.
+        """
+        out, size, error = [], 0, None
+        end = time.monotonic() + FETCH_SLICE_SECONDS
+        while pos < len(targets):
+            i, m = targets[pos]
+            try:
+                parts = [self.fetch_item(m, it) for it in items]
+            except Exception as e:      # re-raised by the caller, after the earlier responses
+                error = e
+                break
+            resp = b"* %d FETCH (" % i + b" ".join(parts) + b")\r\n"
+            out.append(resp)
+            size += len(resp)
+            pos += 1
+            if time.monotonic() >= end or size >= FETCH_SLICE_BYTES:
+                break
+        return out, pos, error
+
     async def _fetch(self, a, uid_mode):
         self.need_sel()
         if len(a) < 2:
@@ -925,10 +1047,23 @@ class Session:
             items.insert(0, "UID")
         n = len(self.msgs)
         ranges = parse_set(a[0], (self.msgs[-1].uid if uid_mode and n else n))
-        for i, m in enumerate(self.msgs, 1):
-            if in_set(m.uid if uid_mode else i, ranges):
-                parts = [self.fetch_item(m, it) for it in items]
-                await self.send(b"* %d FETCH (" % i + b" ".join(parts) + b")\r\n")
+        targets = [(i, m) for i, m in enumerate(self.msgs, 1)
+                   if in_set(m.uid if uid_mode else i, ranges)]
+        # Anything beyond the database row means reading and parsing files: do that on a worker
+        # thread, a slice at a time, so other connections keep being served.
+        light = all(it.upper() in self.LIGHT_ITEMS for it in items)
+        pos = 0
+        while pos < len(targets):
+            if light:
+                out, pos, error = self._fetch_chunk(targets, pos, items)
+            else:
+                out, pos, error = await self._run(self._fetch_chunk, targets, pos, items)
+            if out:
+                await self.send(*out)
+            if error is not None:
+                raise error
+            if light:
+                await asyncio.sleep(0)
 
     async def cmd_fetch(self, a):
         await self._fetch(a, False)
@@ -946,7 +1081,12 @@ class Session:
 
         def hsub(name, needle):
             needle = needle.lower()
-            return lambda i, m: needle in dec(hdr(self.loaded(m).parsed, name) or "").lower()
+
+            def pred(i, m):
+                v = hdr(self.loaded(m).parsed, name)
+                # RFC 3501: an empty string matches every message that has the header.
+                return v is not None and needle in dec(v).lower()
+            return pred
 
         def one():
             t = nxt()
@@ -1006,24 +1146,32 @@ class Session:
             preds.append(one())
         return lambda i, m: all(p(i, m) for p in preds)
 
+    def _search_chunk(self, pred, pos, uid_mode, hits):
+        """Evaluate pred on self.msgs[pos:] for about SEARCH_SLICE_SECONDS; return the next pos."""
+        msgs = self.msgs
+        end = time.monotonic() + SEARCH_SLICE_SECONDS
+        while pos < len(msgs):
+            m = msgs[pos]
+            pos += 1
+            if pred(pos, m):
+                hits.append(m.uid if uid_mode else pos)
+            if time.monotonic() >= end:
+                break
+        return pos
+
     async def _search(self, a, uid_mode):
         self.need_sel()
         if len(a) >= 2 and isinstance(a[0], str) and a[0].upper() == "CHARSET":
             a = a[2:]
         pred = self.parse_search(a)
-        # A text search reads and parses every message in the folder. Doing that in one go would freeze the whole
-        # server (every other connection, every other account) for the duration, so work in short time slices,
-        # let the other connections run in between, and give up as soon as this client has disconnected.
-        hits = []
-        slice_end = time.monotonic() + SEARCH_SLICE_SECONDS
-        for i, m in enumerate(self.msgs, 1):
-            if pred(i, m):
-                hits.append(m.uid if uid_mode else i)
-            if time.monotonic() >= slice_end:
-                await asyncio.sleep(0)
-                if self.reader.at_eof():
-                    raise ClientGone()
-                slice_end = time.monotonic() + SEARCH_SLICE_SECONDS
+        # A text search reads and parses every message in the folder. That runs on a worker
+        # thread in short slices; between slices this connection checks that the client is
+        # still there, so a client that gives up does not leave the server grinding on.
+        hits, pos = [], 0
+        while pos < len(self.msgs):
+            pos = await self._run(self._search_chunk, pred, pos, uid_mode, hits)
+            if pos < len(self.msgs) and self.reader.at_eof():
+                raise ClientGone()
         await self.send(("* SEARCH" + "".join(f" {h}" for h in hits) + "\r\n"))
 
     async def cmd_search(self, a):
@@ -1053,7 +1201,8 @@ DEFAULT_CONFIG = os.path.join(SCRIPT_DIR, "imap_archive_server.ini")
 # section -> option -> default (None = required). Documentation lives in the .ini.
 GLOBAL_SCHEMA = {
     "server": {"host": "0.0.0.0", "port": "1143", "allow_networks": "",
-               "cache_messages": "16", "verify_on_read": "true"},
+               "cache_messages": "16", "verify_on_read": "true",
+               "login_timeout": "120", "idle_timeout": "1800", "max_connections": "100"},
     "tls": {"cert": "", "key": "", "port": "", "also_plain": "false"},
     "auth": {"password_file": "imap_archive_server.passwd"},
     "logging": {"level": "INFO", "file": ""},
@@ -1079,6 +1228,9 @@ class Config:
     allow_networks: list = field(default_factory=list)
     cache_messages: int = 16
     verify_on_read: bool = True
+    login_timeout: int = 120    # seconds a client has to log in; 0 = no limit
+    idle_timeout: int = 1800    # seconds a logged-in client may be silent; 0 = no limit
+    max_connections: int = 100  # simultaneous connections; 0 = no limit
     cert: str = ""
     key: str = ""
     tls_port: int = 0           # 0 = not set: [server] port itself carries TLS when a cert is set
@@ -1207,6 +1359,9 @@ def load_config(path):
         port=as_int("server", "port", 1, 65535),
         allow_networks=nets,
         cache_messages=as_int("server", "cache_messages", 1, 10000),
+        login_timeout=as_int("server", "login_timeout", 0, 86400),
+        idle_timeout=as_int("server", "idle_timeout", 0, 86400),
+        max_connections=as_int("server", "max_connections", 0, 100000),
         verify_on_read=verify_raw in ("true", "yes", "on", "1"),
         cert=cert, key=key, tls_port=tls_port, also_plain=also_plain,
         password_file=rpath(get("auth", "password_file")),
@@ -1272,6 +1427,10 @@ async def serve(cfg, accounts):
     auth_gate = asyncio.Semaphore(2)        # at most 2 scrypt computations at once
     dummy_hash = hash_password(os.urandom(16).hex())
     writers = set()   # open client connections, closed on shutdown
+    # Threads for blocking work (SQLite, file reads, MIME parsing), so that one client's big
+    # FETCH or SEARCH does not stall the others. Separate from the default executor, which
+    # password hashing uses, so a login flood cannot starve readers (or the other way round).
+    executor = ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="imapd")
 
     async def handle(r, w):
         peer = w.get_extra_info("peername")
@@ -1279,10 +1438,20 @@ async def serve(cfg, accounts):
             log.warning("rejected connection from %s (not in allow_networks)", peer[0])
             w.close()
             return
+        if cfg.max_connections and len(writers) >= cfg.max_connections:
+            log.warning("rejected connection from %s (max_connections = %d reached)",
+                        peer[0], cfg.max_connections)
+            try:
+                w.write(b"* BYE Too many connections\r\n")
+                await asyncio.wait_for(w.drain(), 5)
+            except (ConnectionError, OSError, asyncio.TimeoutError):
+                pass
+            w.close()
+            return
         log.info("connection from %s", peer)
         writers.add(w)
         try:
-            await Session(r, w, accounts, cfg, auth_gate, dummy_hash).run()
+            await Session(r, w, accounts, cfg, auth_gate, dummy_hash, executor).run()
         finally:
             writers.discard(w)
 
@@ -1328,6 +1497,7 @@ async def serve(cfg, accounts):
         await asyncio.wait_for(asyncio.gather(*(sv.wait_closed() for sv in servers)), 5)
     except asyncio.TimeoutError:
         log.warning("some connections did not close within 5 seconds")
+    executor.shutdown(wait=False, cancel_futures=True)
 
 
 def main():
