@@ -20,7 +20,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Client, ServerProc, SERVER_PY          # noqa: E402
-from repo_factory import build_repo, multipart_message, simple_message   # noqa: E402
+from repo_factory import (build_imap_importer_repo, build_repo, multipart_message,   # noqa: E402
+                          simple_message)
 
 PASSWORD = "correct horse battery"
 
@@ -268,6 +269,136 @@ class ProtocolTests(Base):
         typ, data = m.uid("SEARCH", None, "UNSEEN")
         self.assertEqual(data[0].split(), [b"2", b"3"])
         m.logout()
+
+
+class GenericImapRepositoryTests(Base):
+    """Repositories written by the generic IMAP importer (Yahoo, Dovecot, Outlook.com over OAuth...).
+
+    The layout differs from the Gmail one: no gm_id, files named <sha256>.eml, a per-folder
+    delimiter, and importer-only tables the server ignores.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        tmp = cls.make_tmp()
+        msgs = [
+            dict(raw=simple_message(1, "Hello world"), folders=["INBOX", "Archive"], read=True),
+            dict(raw=simple_message(2, "Quarterly report", "dave@example.com", "zebra"),
+                 folders=["INBOX"], starred=True, flags="\\Answered"),
+            dict(raw=multipart_message(3), folders=["Sent Items"]),
+        ]
+        cls.slash = os.path.join(tmp, "slash")
+        build_imap_importer_repo(cls.slash, msgs)
+        cls.dot = os.path.join(tmp, "dot")      # Dovecot-style namespace: '.' separates levels
+        build_imap_importer_repo(cls.dot, [
+            dict(raw=simple_message(1), folders=["INBOX", "INBOX.Sent"]),
+            dict(raw=simple_message(2), folders=["INBOX.Projects.Travel"])], delimiter=".")
+        cls.srv = cls.start({"me": (cls.slash, PASSWORD, {}), "dot": (cls.dot, PASSWORD, {})})
+
+    def test_list_select_fetch_search(self):
+        c = self.client()
+        names = c.cmd('LIST "" "*"').blob.decode()
+        for n in ("INBOX", "Archive", "Sent Items"):
+            self.assertIn(n, names)
+        self.assertIn(b"MESSAGES 2", c.cmd("STATUS INBOX (MESSAGES UNSEEN)").blob)
+        self.assertTrue(c.cmd("EXAMINE INBOX").ok())
+        r = c.cmd("UID FETCH 1:* (FLAGS INTERNALDATE RFC822.SIZE)")
+        self.assertIn("FLAGS (\\Seen)", r.blob.decode())
+        self.assertIn('INTERNALDATE "17-Jul-2024 09:44:25 +0000"', r.blob.decode())
+        self.assertEqual(c.cmd("UID FETCH 1 (BODY.PEEK[])").literal("BODY[]"),
+                         simple_message(1, "Hello world"))
+        self.assertIn(b"* SEARCH 2", c.cmd("UID SEARCH BODY zebra").blob)
+        self.assertIn(b"* SEARCH 2", c.cmd("UID SEARCH FLAGGED").blob)
+        c.cmd('SELECT "Sent Items"')
+        self.assertEqual(c.cmd("UID FETCH 3 (BODY.PEEK[1])").literal("BODY[1]"), b"hello 3")
+
+    def test_verify_uses_sha256_for_generic_repositories(self):
+        r = self.srv.run("--verify")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("0 problem(s)", r.stdout)
+
+    def test_folder_with_dot_delimiter_is_listed_as_stored(self):
+        # Characterisation: the server does not read folders.delimiter; names are listed as stored
+        # and always reported with '/' as the hierarchy delimiter. Spec item C2 changes this.
+        c = self.client(login="dot")
+        names = c.cmd('LIST "" "*"').blob.decode()
+        self.assertIn("INBOX.Sent", names)
+        self.assertIn("INBOX.Projects.Travel", names)
+        self.assertTrue(c.cmd("SELECT INBOX.Sent").ok())
+
+
+class InboxCaseTests(Base):
+    """INBOX is case-insensitive (RFC 3501 6.3.1); every other folder name stays an exact match.
+
+    Yahoo and Outlook.com archives store the folder as 'Inbox', so a standard client's
+    'SELECT INBOX' used to answer 'NO no such mailbox'.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        tmp = cls.make_tmp()
+        five = [dict(raw=simple_message(i), folders=["Inbox"], read=True) for i in range(1, 6)]
+        other = [dict(raw=simple_message(10), folders=["Sent"]),
+                 dict(raw=simple_message(11), folders=["Inboxes"])]
+        cls.mixed_case = os.path.join(tmp, "mixed")
+        build_imap_importer_repo(cls.mixed_case, five + other)
+        cls.both = os.path.join(tmp, "both")             # two spellings stored side by side
+        build_imap_importer_repo(cls.both, [dict(raw=simple_message(1), folders=["INBOX"]),
+                                            dict(raw=simple_message(2), folders=["INBOX"]),
+                                            dict(raw=simple_message(3), folders=["Inbox"])])
+        cls.upper = os.path.join(tmp, "upper")           # Gmail style, already 'INBOX'
+        build_repo(cls.upper, basic_messages())
+        cls.srv = cls.start({"mixed": (cls.mixed_case, PASSWORD, {}),
+                             "both": (cls.both, PASSWORD, {}),
+                             "upper": (cls.upper, PASSWORD, {}),
+                             "hidden": (cls.mixed_case, PASSWORD, {"hide_folders": "Inbox"})})
+
+    def test_every_spelling_of_inbox_opens_the_stored_folder(self):
+        c = self.client(login="mixed")
+        for name in ("INBOX", "inbox", "Inbox", "iNbOx"):
+            for cmd in ("SELECT", "EXAMINE"):
+                r = c.cmd(f"{cmd} {name}")
+                self.assertTrue(r.ok(), f"{cmd} {name}: {r.line}")
+                self.assertIn(b"5 EXISTS", r.blob)
+        r = c.cmd("STATUS INBOX (MESSAGES UNSEEN)")
+        self.assertIn(b'* STATUS "INBOX" (MESSAGES 5 UNSEEN 0)', r.blob)   # echoes the request
+        self.assertEqual(c.cmd("UID FETCH 1 (BODY.PEEK[])").status, "OK")
+
+    def test_list_shows_the_stored_name_and_finds_it_by_any_spelling(self):
+        c = self.client(login="mixed")
+        full = c.cmd('LIST "" "*"').blob.decode()
+        self.assertIn('"Inbox"', full)              # reported as stored, not renamed
+        self.assertNotIn('"INBOX"', full)
+        for pat in ("INBOX", "inbox", "Inbox"):
+            r = c.cmd(f'LIST "" "{pat}"').blob.decode()
+            self.assertEqual(r.strip(), '* LIST () "/" "Inbox"', pat)
+        self.assertEqual(c.cmd('LIST "" "Inb*"').blob.decode().count("LIST"), 2)   # Inbox, Inboxes
+        self.assertEqual(c.cmd('LIST "" "INB*"').blob.decode().strip(), "")        # wildcards unchanged
+
+    def test_other_names_stay_exact(self):
+        c = self.client(login="mixed")
+        for name in ("sent", "SENT", "Inbo", "Inboxes2", '"Inbox "', "inboxes"):
+            self.assertEqual(c.cmd(f"SELECT {name}").status, "NO", name)
+        self.assertTrue(c.cmd("SELECT Sent").ok())
+        self.assertTrue(c.cmd("SELECT Inboxes").ok())
+        self.assertEqual(c.cmd("SELECT \u0131nbox").status, "NO")      # dotless i is not an I
+
+    def test_exact_spelling_wins_when_two_are_stored(self):
+        c = self.client(login="both")
+        self.assertIn(b"2 EXISTS", c.cmd("SELECT INBOX").blob)
+        self.assertIn(b"1 EXISTS", c.cmd("SELECT Inbox").blob)
+        self.assertIn(b"2 EXISTS", c.cmd("SELECT inbox").blob)          # first in sort order
+
+    def test_inbox_unchanged_when_already_upper_case(self):
+        c = self.client(login="upper")
+        self.assertIn(b"3 EXISTS", c.cmd("SELECT INBOX").blob)
+        self.assertIn(b"3 EXISTS", c.cmd("SELECT inbox").blob)
+
+    def test_hide_folders_still_hides_the_resolved_folder(self):
+        c = self.client(login="hidden")
+        for name in ("INBOX", "Inbox", "inbox"):
+            self.assertEqual(c.cmd(f"SELECT {name}").status, "NO", name)
+        self.assertEqual(c.cmd('LIST "" "INBOX"').blob, b"")
 
 
 class AuthTests(Base):

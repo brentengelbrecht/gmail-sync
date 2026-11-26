@@ -641,6 +641,10 @@ only its tag and command name are logged, never a password.
 
 ## Known limitations
 
+- **The inbox name is reported as stored.** `INBOX` is matched case-insensitively in `SELECT`, `EXAMINE`,
+  `STATUS` and `LIST` (RFC 3501), so `SELECT INBOX` works on Yahoo and Outlook.com archives, which store
+  the folder as `Inbox`. `LIST` still shows the stored name (`Inbox`). Every other folder name is matched
+  exactly, case included.
 - **The repository must not be replaced or rebuilt while the server is running.**
   The importer may keep adding or updating messages (new mail appears after a
   client re-selects the folder), but `repository.json`, `repository.db` and the

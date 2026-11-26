@@ -152,11 +152,37 @@ class ArchiveBackend:
             names = [r[0] for r in db.execute("SELECT name FROM folders ORDER BY name")]
         return [n for n in names if not self._hidden(n)]
 
+    @staticmethod
+    def _is_inbox_name(name):
+        # ASCII only: str.upper() would also fold characters such as a dotless i into 'I'.
+        return name.isascii() and name.lower() == "inbox"
+
+    def _resolve_folder(self, db, name):
+        """Map a requested mailbox name to the stored folder name.
+
+        RFC 3501 6.3.1: INBOX is case-insensitive. Some servers (Yahoo, Outlook.com) call the
+        folder 'Inbox', and the importer stores it that way. Every other name, and an INBOX that
+        exists under exactly the requested spelling, must match exactly. If several spellings of
+        INBOX are stored, the first in sort order wins.
+        """
+        if not self._is_inbox_name(name):
+            return name
+        stored = sorted(r[0] for r in db.execute("SELECT name FROM folders"))
+        if name in stored:
+            return name
+        for candidate in stored:
+            if self._is_inbox_name(candidate):
+                return candidate
+        return name
+
     def load(self, folder):
         """Return (uidvalidity, [Msg sorted by uid]). Raise KeyError if no such folder."""
-        if self._hidden(folder):
+        if self._hidden(folder) and not self._is_inbox_name(folder):
             raise KeyError(folder)
         with closing(self._db()) as db:
+            folder = self._resolve_folder(db, folder)
+            if self._hidden(folder):
+                raise KeyError(folder)
             if not db.execute("SELECT 1 FROM folders WHERE name=?", (folder,)).fetchone():
                 raise KeyError(folder)
             rows = db.execute(
@@ -879,9 +905,10 @@ class Session:
         rx = re.compile("^" + "".join(
             ".*" if c == "*" else "[^/]*" if c == "%" else re.escape(c)
             for c in ref + pat) + "$")
+        inbox_only = self.backend._is_inbox_name(ref + pat)   # LIST "" "inbox" finds 'Inbox'
         for f in await self._run(self.backend.folders):
             enc = utf7_encode(f)
-            if rx.match(enc):
+            if rx.match(enc) or (inbox_only and self.backend._is_inbox_name(f)):
                 await self.send(f"* {kw} () \"/\" ".encode() + q(enc) + b"\r\n")
 
     async def cmd_list(self, a):

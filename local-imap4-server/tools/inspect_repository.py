@@ -11,8 +11,10 @@ Answers two questions without changing anything in the repository:
 Usage:
     python3 tools/inspect_repository.py /path/to/repository [--sample 300] [--state-dir DIR]
 
-The repository database is opened read-only. The only thing written is a temporary SQLite file
-(in the system temp directory, deleted at exit) used to measure full-text index size.
+The repository data is never modified: the database is opened like the server does it (normal
+connection, PRAGMA query_only=ON), which on a WAL database may create the small -wal/-shm helper
+files, so run it as the user that runs the server. The only other thing written is a temporary
+SQLite file (system temp directory, deleted at exit) used to measure full-text index size.
 Standard library only (Python 3.9+).
 """
 import argparse
@@ -67,8 +69,23 @@ def classify_ids(values):
 
 
 def open_ro(path):
-    uri = "file:" + path.replace("?", "%3f").replace("#", "%23") + "?mode=ro"
-    db = sqlite3.connect(uri, uri=True, timeout=10)
+    """Open the repository database the same way the server does (see AGENTS.md, 'Database
+    access'): a normal connection with PRAGMA query_only=ON. A mode=ro connection can fail on the
+    importer's WAL-mode database. Nothing is ever written to the data, but SQLite may create the
+    small -wal/-shm helper files, so the folder must be writable by the user running the script."""
+    if not os.path.isfile(path):          # a plain connect would silently create an empty file
+        sys.exit(f"No database at {path}")
+    try:
+        db = sqlite3.connect(path, timeout=10)
+        db.execute("PRAGMA query_only=ON")
+        db.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+    except sqlite3.Error as e:
+        folder = os.path.dirname(path)
+        sys.exit(f"Cannot open {path}: {e}\n"
+                 f"  readable: {os.access(path, os.R_OK)}; folder writable (needed for WAL): "
+                 f"{os.access(folder, os.W_OK)}\n"
+                 "  Run the script as the same user that runs the server, and not while the "
+                 "importer holds an exclusive lock.")
     db.row_factory = sqlite3.Row
     return db
 
@@ -175,6 +192,34 @@ def main():
     n_folders = db.execute("SELECT COUNT(*) FROM folders").fetchone()[0]
     print(f"  Folders (what IMAP clients see as mailboxes/labels): {n_folders:,}")
 
+    # ------------------------------------------------------------------ folders
+    heading("Folders (names, delimiter, message counts)")
+    fcols = columns.get("folders", [])
+    if "delimiter" in fcols:
+        delims = db.execute("SELECT COALESCE(delimiter, '(none)') d, COUNT(*) c FROM folders GROUP BY d").fetchall()
+        print("  Hierarchy delimiters stored by the importer:", {r["d"]: r["c"] for r in delims})
+        if len({r["d"] for r in delims}) > 1:
+            print("  -> MIXED delimiters: the server will need a single one (spec item C2).")
+        elif delims and delims[0]["d"] not in ("/", "(none)"):
+            print(f"  -> The delimiter is {delims[0]['d']!r}, not '/'. Today the server still reports '/' "
+                  "(spec item C2).")
+    else:
+        print("  (no delimiter column; labels in a Gmail repository use '/' inside their names)")
+    rows = db.execute("SELECT f.name n, COUNT(fm.message_id) c FROM folders f "
+                      "LEFT JOIN folder_messages fm ON fm.folder_id = f.folder_id "
+                      "GROUP BY f.folder_id ORDER BY f.name").fetchall()
+    for r in rows[:60]:
+        print(f"  {r['c']:>7,}  {r['n']}")
+    if len(rows) > 60:
+        print(f"  ... and {len(rows) - 60} more")
+    if "server_flags" in columns.get("imap_sources", []):
+        flags = {}
+        for (f,) in db.execute("SELECT server_flags FROM imap_sources WHERE server_flags IS NOT NULL"):
+            for tok in str(f).replace("(", " ").replace(")", " ").replace(",", " ").split():
+                flags[tok] = flags.get(tok, 0) + 1
+        print("  Server flags recorded at import (imap_sources.server_flags):",
+              dict(sorted(flags.items(), key=lambda kv: -kv[1])[:10]) or "none")
+
     # ------------------------------------------------------------------ sampling
     ids = list(message_files(db, repo))
     total_msgs = len(ids)
@@ -221,6 +266,37 @@ def main():
         print(f"  {label:<38} {have[key]:>5} of {n} ({100 * have[key] / max(1, n):.0f}%)")
     print("  THREAD=REFERENCES (RFC 5256) needs only Message-ID/In-Reply-To/References, so threading\n"
           "  can work without Gmail thread ids if most messages have them.")
+    if "gmail_thread_id" in columns.get("messages", []):
+        multi = {r[0] for r in db.execute(
+            "SELECT message_id FROM messages WHERE gmail_thread_id IN (SELECT gmail_thread_id "
+            "FROM messages WHERE gmail_thread_id IS NOT NULL GROUP BY gmail_thread_id "
+            "HAVING COUNT(*) > 1)")}
+        print(f"\n  {len(multi):,} of {total_msgs:,} messages belong to a Gmail thread with 2 or more "
+              f"messages.")
+        pool = [x for x in ids if x[0] in multi]
+        if pool:
+            random.seed(54321)
+            pick = random.sample(pool, min(args.sample, len(pool)))
+            irt = refs = readable = 0
+            for _, path, _size in pick:
+                try:
+                    with open(path, "rb") as f:
+                        raw = f.read(65536)
+                except OSError:
+                    continue
+                readable += 1
+                head = (raw.split(b"\r\n\r\n", 1)[0] if b"\r\n\r\n" in raw else raw.split(b"\n\n", 1)[0]).lower()
+                irt += b"\nin-reply-to:" in b"\n" + head
+                refs += b"\nreferences:" in b"\n" + head
+            print(f"  Of {readable} of those sampled: In-Reply-To in {irt}, References in {refs}.")
+            # in a thread of 2+ messages, at least half the messages are normally replies
+            if readable and max(irt, refs) < 0.3 * readable:
+                print("  -> Most messages that Gmail groups into threads carry no In-Reply-To/References\n"
+                      "     header in the stored files. Header-based threading (RFC 5256 THREAD=REFERENCES)\n"
+                      "     would then find few relationships; gmail_thread_id (X-GM-THRID) is the reliable\n"
+                      "     source of conversation grouping.")
+            elif readable:
+                print("  -> The stored files keep the threading headers, so header-based threading can work.")
     if not n:
         return
 

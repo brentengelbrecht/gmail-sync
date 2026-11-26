@@ -417,7 +417,7 @@ Run `python3 -m unittest discover -s tests -v` (about 30-45 s). Details:
   black-box through the real command line, config and sockets. `ARCHIVE_SERVER=path` runs the suite
   against another copy of the script.
 - `tests/test_server.py` groups: `ProtocolTests` (LIST/STATUS/SELECT/FETCH sections/SEARCH keys/refusals,
-  byte-exact `BODY[]`, characterisation of multipart sub-parts), `AuthTests`, `RobustnessTests`
+  byte-exact `BODY[]`, characterisation of multipart sub-parts), `GenericImapRepositoryTests` (repository written by the generic IMAP importer: sha256 file names, dot-delimited folders, `--verify`), `AuthTests`, `RobustnessTests`
   (login/idle timeouts, connection limit, over-long lines, oversized literals, garbage, abrupt
   disconnects), `DamagedArchiveTests` (missing/corrupt files, `--verify`), `TlsTests` (implicit TLS,
   needs the `openssl` command), `ShutdownTests` (SIGTERM idle and mid-FETCH), `ConcurrencyTests`
@@ -487,6 +487,44 @@ Gotchas for writing tests:
 - A future `state_dir` may live on an SD card or an SSD; use
   `tools/inspect_repository.py` to estimate its size for a real archive.
 - Not yet decided: whether the metadata cache should default to on.
+- **Repository types (owner, 2026-11-25):** archives will not all be Gmail; some will be generic IMAP
+  (`imap-local-repository`) and some Outlook (either archived over IMAP through the generic importer, or
+  through a new importer type that is not defined yet). Every feature must work on every supported type
+  unless it is explicitly Gmail-only. Gmail-only things (`gm_id`, `gmail_thread_id`, the label tables,
+  `X-GM-*`) belong behind capability flags on a per-repository "profile" in the backend, not behind scattered
+  `application == ...` checks. Conversation grouping therefore needs two sources: Gmail thread IDs for Gmail
+  repositories, RFC 5256 header-based threading for the others (see the spec doc, Q5 and G11). Folder-role
+  detection (SPECIAL-USE) needs a built-in table of common folder names for generic IMAP and Outlook
+  archives. Run `tools/inspect_repository.py` on a generic IMAP or Outlook archive to see whether the stored
+  files keep `In-Reply-To`/`References`.
+- **INBOX is case-insensitive (fixed 2026-11-26).** Yahoo and Outlook.com archives store the inbox as
+  `Inbox`, and `SELECT INBOX` used to fail for them (the owner's web client recovered by finding the folder in
+  the `LIST` reply). `ArchiveBackend._resolve_folder()` now maps any ASCII spelling of `INBOX` to the stored
+  folder (an exactly matching spelling wins; with several spellings stored the first in sort order wins);
+  `LIST "" "inbox"` finds it too. Wildcard patterns and every other folder name are unchanged (exact,
+  case-sensitive). **Decision:** `LIST` keeps reporting the stored name (`Inbox`) rather than renaming it to
+  `INBOX`, so nothing a client already shows or remembers changes. `hide_folders` is applied to the
+  resolved stored name. The check is ASCII-only on purpose (`str.upper()` would fold a dotless i into `I`).
+  Tests: `InboxCaseTests`.
+- **Outlook archives are generic IMAP repositories** (owner, 2026-11-25): `imap_local_repository.py` has a
+  `microsoft-oauth2` mode for personal Outlook.com accounts; regular IMAP servers (Yahoo, Dovecot, ...) use
+  its password mode. Both write `imap-local-repository` (schema_version 1). What that layout adds beyond the
+  common columns, and what the server does not use yet: `messages.rfc822_message_id` (Message-ID header),
+  `folders.delimiter` and `folders.imap_name` (the server always reports `/`; names with another
+  delimiter such as `INBOX.Sent` are listed as stored, pinned by a characterisation test), and
+  `imap_sources.server_flags` (raw flags per folder copy, set at import and never updated). The importer
+  reads LIST attributes (`\Sent`, ...) but does not store them. The importer never mirrors later flag changes
+  or deletions. The test factory has `build_imap_importer_repo()`, a verbatim copy of the importer's tables.
+- Checked with `tools/inspect_repository.py` on the owner's real Gmail archive (schema_version 3,
+  2026-11-25; 1,749 messages, 47.7 MB): `messages.gm_id` is 16-character hexadecimal text;
+  `messages.gmail_thread_id` is populated in the same format (1,375 distinct values); `gmail_labels` and
+  `gmail_message_labels` exist. So `X-GM-MSGID`, `X-GM-THRID` (hex converted to a decimal 64-bit number)
+  and `X-GM-LABELS` are possible. None of 300 sampled messages had `In-Reply-To` or `References`; of 300 sampled
+  messages taken from the 486 that sit in multi-message Gmail threads, only 2 had either. So
+  RFC 5256 `THREAD=REFERENCES` would find few relationships (whether the importer drops these headers
+  or the threads are mostly automated mail is not established); prefer `X-GM-THRID` for conversation
+  grouping. Estimated state-file sizes for this archive: metadata cache about 5-7 MB, full-text index
+  about 142 MB (3.9x the text), change log about 70 KB (see the spec doc, section 7).
 
 ## 8. Conventions for changes
 
