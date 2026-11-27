@@ -359,6 +359,43 @@ session would otherwise hang shutdown. This was added after the owner saw a
   connection in sync.
 - Logging: `command_label()` (tag and command name only) is the only part of a command line that may be
   logged, because a LOGIN line contains the password. Keep it that way.
+- **Parser limits** (`MAX_NESTING` 100, `MAX_TOKENS` 10,000): `tokenize()` refuses deeper parenthesis nesting
+  or more items with `BAD`; `parse_search()` counts depth too, including `NOT NOT NOT ...` and `OR` chains,
+  which recurse without parentheses. Before this, nesting of about 500 levels hit Python's recursion limit
+  and answered `NO internal error` with a traceback in the log. The tokenizer itself is iterative.
+  `parse_set()` now returns sorted, merged, disjoint ranges and `in_set()` bisects them. The old linear scan
+  made a 10,000-element set on a 20,000-message folder stall every client for about 8 s (now 0.1 s). Because
+  of that no limit on the number of set elements was added (the spec suggested 10,000): the 64 KiB command
+  line bounds the length and membership is O(log n). `in_set()` REQUIRES a `parse_set()` result.
+- **Login throttling** (`LoginThrottle`): per client IP, in memory, event-loop thread only (no locks).
+  `login_fail_limit` failures within `login_fail_window` block the IP for `login_block_seconds`. Blocked IPs
+  are refused at accept time (`* BYE`) and, for connections already open, in `cmd_login` *before* any
+  scrypt work. Success clears the count. No per-account lockout, on purpose (it would let an attacker lock
+  the owner out). Bounded to `MAX_TRACKED` (10,000) addresses, oldest dropped first. IPv4-mapped IPv6 is
+  normalised; `no_throttle_networks` is exempt. It applies to `LOGIN` only; add it to `AUTHENTICATE` when
+  that exists. The clock is injectable for tests.
+
+### Statistics and slow-command log
+`Stats` (counters) is created in `serve()` and shared with every `Session`; only the event-loop thread
+touches it. Command names come from `stat_name()`, which only returns names of real `cmd_*` handlers
+(`(unknown)` otherwise) so a client cannot grow the table. Counters are updated in `Session.run()`'s
+`finally:` (so every command is counted once, even on errors) and in `send()` (bytes). The slow-command
+warning uses the same place and logs tag, command name, duration, account and peer, never arguments.
+Output: periodic `stats:` line (`[logging] stats_interval`), `SIGUSR1`, and a final line at shutdown when
+the interval is above 0. Nothing in a stats line may ever contain arguments, folder names, account names or
+message content; `StatsAndSlowCommandTests` asserts that.
+
+### Configuration checks and startup
+`check_tls()`, `check_passwords()`, `check_accounts()` and `check_bind()` return `(level, text)` findings;
+`run_check_config()` prints them and sets the exit status (0 ok, 1 failures or warnings with `--strict`, 2
+config unreadable); `startup_checks()` runs the TLS and account checks at normal startup (failures abort,
+warnings are logged; passwords are already checked by `build_accounts`). `REQUIRED_COLUMNS` lists the
+tables and columns the server reads: update it whenever a query uses a new column, or `--check-config` and
+the startup check will miss (or wrongly report) it. Certificate expiry uses `ssl._ssl._test_decode_cert`
+(a private CPython helper, guarded; the expiry check is skipped if it is missing) because the standard
+library has no public certificate parser. `listeners_for()` is the one place that decides which ports and
+TLS modes are opened; `serve()` and `check_bind()` both use it. A database that is locked at startup is a
+WARN, not a FAIL. The Python version check (`python_too_old()`, `MIN_PYTHON`) runs first thing at import.
 
 ### Read-only invariant
 Every mutating command (`STORE`, `COPY`, `EXPUNGE`, `APPEND`, `CREATE`,
@@ -409,7 +446,8 @@ protection).
 
 ## 6. Testing
 
-Run `python3 -m unittest discover -s tests -v` (about 30-45 s). Details:
+Run `python3 -m unittest discover -s tests -v` (about 2 minutes; the throttle tests wait on the
+one-second failed-login delay). Details:
 
 - `tests/repo_factory.py` builds synthetic repositories from the importers' table layout (Gmail schema 2
   and generic-IMAP schema 1) in a temp directory. `tests/harness.py` starts the server as a subprocess
@@ -421,7 +459,14 @@ Run `python3 -m unittest discover -s tests -v` (about 30-45 s). Details:
   (login/idle timeouts, connection limit, over-long lines, oversized literals, garbage, abrupt
   disconnects), `DamagedArchiveTests` (missing/corrupt files, `--verify`), `TlsTests` (implicit TLS,
   needs the `openssl` command), `ShutdownTests` (SIGTERM idle and mid-FETCH), `ConcurrencyTests`
-  (another client's NOOP latency while a big FETCH/SEARCH runs, 3,000 messages), `UnitTests`.
+  (another client's NOOP latency while a big FETCH/SEARCH runs, 3,000 messages), `StatsAndSlowCommandTests`
+  (exact counters via SIGUSR1, periodic and final lines, no content in the line, slow-command warning),
+  `ParserLimitTests` (nesting/NOT/OR/item limits, no traceback, long message sets), `LoginThrottleTests`
+  (block, expiry, reset on success, exempt network, window, off switch), `CheckConfigTests`
+  (`--check-config` outcomes and exit codes, TLS, bind, startup refusal/warnings), `InboxCaseTests`,
+  `UnitTests` (including the throttle logic with a fake clock, `parse_set`/`in_set` against a naive scan,
+  `python_too_old`).
+  The harness passes `auth_opts`, `logging_opts` and `tls_opts` through to the generated `.ini`.
 - `tests/compare_servers.py OLD.py [NEW.py]` sends ~130 commands to two versions of the script over the
   same repository and prints every reply that differs. Run it before and after any refactoring of the
   protocol or MIME code; it is the main safety net for "don't change behaviour" work. The only known
@@ -433,9 +478,8 @@ Run `python3 -m unittest discover -s tests -v` (about 30-45 s). Details:
 
 Still not covered: Apple/iOS/Outlook clients, STARTTLS (not implemented), very large repositories (100k+
 messages), running against a live importer, and non-CPython interpreters. Only Python 3.12 has been used
-for testing; Python 3.11 is the required minimum (section 1). The code does not
-yet refuse to start on older versions; adding that check is part of the next
-protocol work.
+for testing; Python 3.11 is the required minimum (section 1) and the server now refuses to start on an
+older version (the check is unit-tested with fake version numbers, not on a real older interpreter).
 
 Gotchas for writing tests:
 
@@ -470,6 +514,11 @@ Gotchas for writing tests:
 8. If write features are ever added: sidecar UID table (see section 4), and a
    design for where local flags/folder changes are stored without fighting the
    importer.
+
+### Done from the spec doc (2026-11-27)
+Statistics and slow-command logging (H4), login throttling (H1), parser limits (H2, parser part only: the
+per-IP connection cap, a command-rate limit and a configurable literal size are not done), `--check-config`
+and startup checks (H3), and the Python 3.11 startup check. Notes on each are in section 4.
 
 ### Decisions already made about the backlog (owner, 2026-11-25)
 - The web client is the only required client; priorities follow from that

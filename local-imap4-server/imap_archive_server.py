@@ -24,12 +24,32 @@ documented there). Usage:
     ./imap_archive_server.py --set-password USER # create/change an account's password
     ./imap_archive_server.py --verify            # check every file's size/SHA-256, then exit
     ./imap_archive_server.py --verify --account USER   # ... for one account only
+    ./imap_archive_server.py --check-config      # validate the .ini, accounts, TLS, passwords; no server
+    ./imap_archive_server.py --check-config --strict --check-bind
     ./imap_archive_server.py -v                  # run with debug logging
     ./imap_archive_server.py --config /path/to/other.ini
 """
+import sys
+
+MIN_PYTHON = (3, 11)
+
+
+def python_too_old(version_info=None, minimum=MIN_PYTHON):
+    """A message if this Python is older than `minimum`, else None."""
+    v = tuple(version_info if version_info is not None else sys.version_info)[:2]
+    if v < tuple(minimum):
+        return (f"imap_archive_server needs Python {minimum[0]}.{minimum[1]} or later "
+                f"(this is Python {v[0]}.{v[1]}); please upgrade")
+    return None
+
+
+if python_too_old():
+    sys.exit(python_too_old())
+
 import argparse
 import asyncio
 import base64
+import bisect
 import configparser
 import email
 import fnmatch
@@ -43,10 +63,10 @@ import os
 import re
 import signal
 import sqlite3
+import socket
 import ssl
-import sys
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -103,6 +123,17 @@ SUPPORTED_REPOSITORIES = {
 }
 
 
+# Tables and columns the server reads (load(), all_messages(), folders()); --check-config and the
+# startup check verify them so that an incompatible repository fails early with a clear message.
+REQUIRED_COLUMNS = {
+    "folders": {"folder_id", "name"},
+    "folder_messages": {"folder_id", "message_id"},
+    "messages": {"message_id", "shard_id", "filename", "message_size", "sha256", "internal_date",
+                 "imported_at", "is_read", "is_starred"},
+    "message_shards": {"shard_id", "directory_name"},
+}
+
+
 class ArchiveBackend:
     def __init__(self, repo_dir, uidvalidity="auto", hide=()):
         self.repo_dir = repo_dir
@@ -146,6 +177,18 @@ class ArchiveBackend:
         db = sqlite3.connect(self.db_path, timeout=10)
         db.execute("PRAGMA query_only=ON")
         return db
+
+    def missing_columns(self):
+        """['table.column', ...] the server needs but the database lacks ('table' if absent)."""
+        missing = []
+        with closing(self._db()) as db:
+            for table, needed in sorted(REQUIRED_COLUMNS.items()):
+                have = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+                if not have:
+                    missing.append(table)
+                else:
+                    missing += [f"{table}.{c}" for c in sorted(needed - have)]
+        return missing
 
     def folders(self):
         with closing(self._db()) as db:
@@ -259,6 +302,8 @@ FETCH_SLICE_SECONDS = 0.05
 FETCH_SLICE_BYTES = 1 << 20   # ... or this many bytes of FETCH output, whichever comes first
 WORKER_THREADS = 4            # threads for disk/SQLite/MIME work (password hashing has its own)
 MAX_LITERAL = 10_000_000      # largest single client literal
+MAX_NESTING = 100             # deepest parenthesis / NOT / OR nesting a command may use
+MAX_TOKENS = 10_000           # most items (atoms, strings, lists) in one command
 MAX_COMMAND_BYTES = 10_000_000  # largest whole command, literals included
 WRITE_TIMEOUT = 120           # drop a client that has not read what we sent for this long
 
@@ -515,6 +560,12 @@ def fmt_date(d):
 
 
 def parse_set(s, maxval):
+    """Parse '1:3,7,10:*' into sorted, merged, non-overlapping (lo, hi) ranges.
+
+    The result is normalised so that in_set() can bisect: a set with thousands of elements
+    costs O(log n) per message instead of O(n), which would otherwise let one long command
+    stall the event loop.
+    """
     out = []
     for part in s.split(","):
         a, _, b = part.partition(":")
@@ -522,11 +573,21 @@ def parse_set(s, maxval):
         lo = n(a)
         hi = n(b) if b else lo
         out.append((min(lo, hi), max(lo, hi)))
-    return out
+    out.sort()
+    merged = []
+    for lo, hi in out:
+        if merged and lo <= merged[-1][1] + 1:
+            if hi > merged[-1][1]:
+                merged[-1] = (merged[-1][0], hi)
+        else:
+            merged.append((lo, hi))
+    return merged
 
 
 def in_set(v, ranges):
-    return any(lo <= v <= hi for lo, hi in ranges)
+    """Is v inside ranges as returned by parse_set (sorted and disjoint)?"""
+    i = bisect.bisect_right(ranges, (v, float("inf"))) - 1
+    return i >= 0 and v <= ranges[i][1]
 
 
 def parse_imap_date(s):
@@ -535,17 +596,24 @@ def parse_imap_date(s):
 
 
 def tokenize(s):
-    stack, pos, n = [[]], 0, len(s)
+    stack, pos, n, count = [[]], 0, len(s), 0
     while pos < n:
         c = s[pos]
         if c in " \t":
             pos += 1
-        elif c == "(":
+            continue
+        count += 1
+        if count > MAX_TOKENS:
+            raise Err("BAD", f"command too complex (more than {MAX_TOKENS} items)")
+        if c == "(":
+            if len(stack) > MAX_NESTING:
+                raise Err("BAD", f"parentheses nested too deeply (more than {MAX_NESTING} levels)")
             stack.append([])
             pos += 1
         elif c == ")":
             if len(stack) < 2:
                 raise Err("BAD", "unbalanced parentheses")
+            count -= 1                      # a closing parenthesis is not an item
             l = stack.pop()
             stack[-1].append(l)
             pos += 1
@@ -700,12 +768,139 @@ MACROS = {"ALL": ["FLAGS", "INTERNALDATE", "RFC822.SIZE", "ENVELOPE"],
           "FULL": ["FLAGS", "INTERNALDATE", "RFC822.SIZE", "ENVELOPE", "BODY"]}
 
 
+class Stats:
+    """Counters since the server started, for the periodic 'stats:' log line and SIGUSR1.
+
+    Only the event-loop thread updates them, so there is no locking. They hold counts and
+    command names only: never arguments, folder names, user names or message content.
+    """
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self.started = clock()
+        self.connections = 0
+        self.rejected = Counter()           # reason -> connections refused
+        self.logins_ok = self.logins_failed = self.logins_throttled = 0
+        self.commands = Counter()           # 'FETCH', 'UID SEARCH', ... -> times run
+        self.slow_commands = 0
+        self.bytes_sent = 0
+        self.errors = Counter()             # kind -> times
+
+    @staticmethod
+    def _fmt(counter):
+        return ",".join(f"{k.replace(' ', '_')}:{v}" for k, v in sorted(counter.items())) or "-"
+
+    def line(self, open_connections=0):
+        return (f"stats: uptime={int(self._clock() - self.started)}s connections={self.connections} "
+                f"open={open_connections} rejected={self._fmt(self.rejected)} "
+                f"logins_ok={self.logins_ok} logins_failed={self.logins_failed} "
+                f"logins_throttled={self.logins_throttled} commands={self._fmt(self.commands)} "
+                f"slow_commands={self.slow_commands} bytes_sent={self.bytes_sent} "
+                f"errors={self._fmt(self.errors)}")
+
+
+def stat_name(cmd, args=None):
+    """Command name for the statistics. Only known names are used, so a client cannot make
+    the counter table grow by sending garbage."""
+    if not hasattr(Session, "cmd_" + cmd):
+        return "(unknown)"
+    name = cmd.upper()
+    if cmd == "uid" and args and isinstance(args[0], str) \
+            and args[0].upper() in ("FETCH", "SEARCH", "STORE", "COPY", "EXPUNGE"):
+        name += " " + args[0].upper()
+    return name
+
+
+class LoginThrottle:
+    """Per-client-IP limiter for failed logins (in memory, event-loop thread only).
+
+    `limit` failures within `window` seconds block the IP for `block_seconds`; a successful
+    login clears the IP's count. There is deliberately no per-account lockout, which would let
+    an attacker lock the real user out. limit = 0 disables everything. State is not persisted
+    and is bounded: at most MAX_TRACKED addresses are remembered, the oldest are dropped first.
+    Many users behind one NAT address share one counter.
+    """
+    MAX_TRACKED = 10_000
+
+    def __init__(self, limit, window, block_seconds, exempt=(), clock=time.monotonic):
+        self.limit, self.window, self.block_seconds = limit, window, block_seconds
+        self.exempt = list(exempt)
+        self.clock = clock
+        self.failures = OrderedDict()       # ip -> deque of failure times
+        self.blocked = OrderedDict()        # ip -> time the block ends (insertion order = expiry order)
+
+    @staticmethod
+    def _norm(ip):
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return None
+        return str(getattr(a, "ipv4_mapped", None) or a)
+
+    def _exempt(self, ip):
+        a = ipaddress.ip_address(ip)
+        return any(a in n for n in self.exempt)
+
+    def applies(self, ip):
+        ip = self._norm(ip)
+        return bool(self.limit) and ip is not None and not self._exempt(ip)
+
+    def blocked_for(self, ip):
+        """Seconds left on this IP's block (0 = not blocked)."""
+        if not self.applies(ip):
+            return 0
+        ip = self._norm(ip)
+        until = self.blocked.get(ip)
+        if until is None:
+            return 0
+        left = until - self.clock()
+        if left <= 0:
+            del self.blocked[ip]
+            log.info("login block on %s has ended", ip)
+            return 0
+        return left
+
+    def record_failure(self, ip):
+        """Count a failed login; True if this one put the IP into a block."""
+        if not self.applies(ip):
+            return False
+        ip = self._norm(ip)
+        now = self.clock()
+        times = self.failures.get(ip)
+        if times is None:
+            times = self.failures[ip] = deque()
+        else:
+            self.failures.move_to_end(ip)
+        times.append(now)
+        while times and now - times[0] > self.window:
+            times.popleft()
+        blocked_now = False
+        if len(times) >= self.limit:
+            self.blocked[ip] = now + self.block_seconds
+            del self.failures[ip]
+            blocked_now = True
+            log.warning("blocking %s for %d s after %d failed logins within %d s",
+                        ip, self.block_seconds, self.limit, self.window)
+        while len(self.failures) > self.MAX_TRACKED:
+            self.failures.popitem(last=False)
+        while len(self.blocked) > self.MAX_TRACKED:
+            self.blocked.popitem(last=False)
+        return blocked_now
+
+    def record_success(self, ip):
+        if self.applies(ip):
+            self.failures.pop(self._norm(ip), None)
+
+
 class Session:
-    def __init__(self, reader, writer, accounts, cfg, auth_gate, dummy_hash, executor=None):
+    def __init__(self, reader, writer, accounts, cfg, auth_gate, dummy_hash, executor=None,
+                 stats=None, throttle=None):
         self.reader, self.writer = reader, writer
         self.accounts, self.cfg = accounts, cfg
         self.auth_gate, self.dummy_hash = auth_gate, dummy_hash
         self.executor = executor        # worker threads for blocking work; None = loop default
+        self.stats = stats if stats is not None else Stats()
+        self.throttle = throttle        # LoginThrottle or None (no throttling)
         self.peer = (writer.get_extra_info("peername") or ("?",))[0]
         self.account = self.backend = None   # bound at LOGIN: a session sees one account only
         self.failed_logins = 0
@@ -716,10 +911,13 @@ class Session:
 
     # ---- I/O ---------------------------------------------------------------
     async def send(self, *parts):
-        self.writer.write(b"".join(p if isinstance(p, bytes) else p.encode() for p in parts))
+        data = b"".join(p if isinstance(p, bytes) else p.encode() for p in parts)
+        self.writer.write(data)
+        self.stats.bytes_sent += len(data)
         try:
             await asyncio.wait_for(self.writer.drain(), WRITE_TIMEOUT)
         except asyncio.TimeoutError:
+            self.stats.errors["write_timeout"] += 1
             raise ConnectionError("client stopped reading")
 
     async def _run(self, fn, *args):
@@ -802,11 +1000,14 @@ class Session:
                 try:
                     line = await asyncio.wait_for(self.read_command(), self._read_timeout(started))
                 except asyncio.TimeoutError:
+                    self.stats.errors["timeout_idle" if self.state != "nonauth"
+                                      else "timeout_login"] += 1
                     await self._bye("Autologout; idle for too long" if self.state != "nonauth"
                                     else "Autologout; login timed out")
                     break
                 except Err as e:
                     if e.fatal:
+                        self.stats.errors["input_limit"] += 1
                         await self._bye(e.text)
                         await self._discard_input()
                         break
@@ -819,27 +1020,44 @@ class Session:
                     await self.send(f"{m.group(1) if m else '*'} BAD missing command\r\n")
                     continue
                 tag, cmd = m.group(1), m.group(2).lower()
+                t0, stat = time.monotonic(), stat_name(cmd)
                 try:
                     h = getattr(self, "cmd_" + cmd, None)
                     if h is None:
                         raise Err("BAD", "unknown command")
-                    text = await h(tokenize(m.group(3) or ""))
+                    args = tokenize(m.group(3) or "")
+                    stat = stat_name(cmd, args)
+                    text = await h(args)
                     await self.send(f"{tag} OK {text or cmd.upper() + ' completed'}\r\n")
                 except ClientGone:
                     break
                 except Err as e:
+                    if "nested too deeply" in e.text or e.text.startswith("command too complex"):
+                        self.stats.errors["parser_limit"] += 1
                     await self.send(f"{tag} {e.status} {e.text}\r\n")
                 except (ValueError, IndexError):
                     await self.send(f"{tag} BAD invalid arguments\r\n")
                 except ConnectionError:
                     break
                 except OSError as e:
+                    self.stats.errors["file"] += 1
                     log.warning("file error: %s", e)
                     await self.send(f"{tag} NO {e.strerror or 'file error'}\r\n")
                 except Exception:
                     # Never log the command line itself: for LOGIN it contains the password.
+                    self.stats.errors["internal"] += 1
                     log.exception("command failed: %s", command_label(line))
                     await self.send(f"{tag} NO internal error\r\n")
+                finally:
+                    self.stats.commands[stat] += 1
+                    took = time.monotonic() - t0
+                    limit = self.cfg.slow_command_seconds
+                    if limit and took >= limit:
+                        self.stats.slow_commands += 1
+                        # Tag and command name only: arguments can hold passwords or folder names.
+                        log.warning("slow command: %s %s took %.1f s (account %s, peer %s)",
+                                    tag[:40], stat, took,
+                                    self.account.name if self.account else "-", self.peer)
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         except asyncio.CancelledError:
@@ -874,6 +1092,11 @@ class Session:
             raise Err("BAD", "already authenticated")
         if len(a) != 2 or not all(isinstance(x, str) for x in a):
             raise Err("BAD", "LOGIN user password")
+        if self.throttle and self.throttle.blocked_for(self.peer):
+            # Blocked address: refuse before any password hashing, so a guessing run costs us nothing.
+            self.stats.logins_throttled += 1
+            await self._bye("Too many failed logins; try again later")
+            raise Err("NO", "too many failed logins")
         acct = self.accounts.get(a[0].strip().lower())
         # Unknown users are checked against a dummy hash so timing doesn't reveal them.
         stored = acct.pw_hash if acct else self.dummy_hash
@@ -882,13 +1105,18 @@ class Session:
                 None, check_password, a[1], stored)
         if not (ok and acct):
             self.failed_logins += 1
+            self.stats.logins_failed += 1
             log.warning("failed login for %r from %s", a[0], self.peer)
+            blocked_now = bool(self.throttle and self.throttle.record_failure(self.peer))
             await asyncio.sleep(1)
-            if self.failed_logins >= 3:
+            if self.failed_logins >= 3 or blocked_now:
                 await self.send(b"* BYE too many failed login attempts\r\n")
                 self.closing = True
             raise Err("NO", "[AUTHENTICATIONFAILED] invalid credentials")
         self.account, self.backend = acct, acct.backend
+        self.stats.logins_ok += 1
+        if self.throttle:
+            self.throttle.record_success(self.peer)
         self.state = "auth"
         log.info("login: %s from %s", acct.name, self.peer)
         return "LOGIN completed"
@@ -1095,7 +1323,9 @@ class Session:
     async def cmd_fetch(self, a):
         await self._fetch(a, False)
 
-    def parse_search(self, toks):
+    def parse_search(self, toks, depth=0):
+        if depth > MAX_NESTING:
+            raise Err("BAD", f"search nested too deeply (more than {MAX_NESTING} levels)")
         pos = [0]
         n = len(self.msgs)
         maxuid = self.msgs[-1].uid if n else 0
@@ -1115,10 +1345,14 @@ class Session:
                 return v is not None and needle in dec(v).lower()
             return pred
 
-        def one():
+        def one(d=0):
+            # d counts NOT/OR chains such as 'NOT NOT NOT ...'; lists add to the depth as well,
+            # so one limit bounds the Python recursion for every shape of nesting.
+            if depth + d > MAX_NESTING:
+                raise Err("BAD", f"search nested too deeply (more than {MAX_NESTING} levels)")
             t = nxt()
             if isinstance(t, list):
-                return self.parse_search(t)
+                return self.parse_search(t, depth + d + 1)
             u = t.upper()
             if u == "ALL":
                 return lambda i, m: True
@@ -1133,10 +1367,10 @@ class Session:
             if u == "OLD":
                 return lambda i, m: True
             if u == "NOT":
-                p = one()
+                p = one(d + 1)
                 return lambda i, m: not p(i, m)
             if u == "OR":
-                p1, p2 = one(), one()
+                p1, p2 = one(d + 1), one(d + 1)
                 return lambda i, m: p1(i, m) or p2(i, m)
             if u == "UID":
                 r = parse_set(nxt(), maxuid)
@@ -1231,8 +1465,9 @@ GLOBAL_SCHEMA = {
                "cache_messages": "16", "verify_on_read": "true",
                "login_timeout": "120", "idle_timeout": "1800", "max_connections": "100"},
     "tls": {"cert": "", "key": "", "port": "", "also_plain": "false"},
-    "auth": {"password_file": "imap_archive_server.passwd"},
-    "logging": {"level": "INFO", "file": ""},
+    "auth": {"password_file": "imap_archive_server.passwd", "login_fail_limit": "5",
+             "login_fail_window": "300", "login_block_seconds": "600", "no_throttle_networks": ""},
+    "logging": {"level": "INFO", "file": "", "stats_interval": "0", "slow_command_seconds": "5"},
 }
 ACCOUNT_PREFIX = "account:"
 ACCOUNT_SCHEMA = {"path": None, "uidvalidity": "auto", "hide_folders": ""}
@@ -1263,8 +1498,14 @@ class Config:
     tls_port: int = 0           # 0 = not set: [server] port itself carries TLS when a cert is set
     also_plain: bool = False    # with tls_port: also open the unencrypted [server] port
     password_file: str = ""
+    login_fail_limit: int = 5       # failed logins from one IP ... ; 0 = no throttling
+    login_fail_window: int = 300    # ... within this many seconds block that IP ...
+    login_block_seconds: int = 600  # ... for this long
+    no_throttle_networks: list = field(default_factory=list)   # never throttled (e.g. the LAN)
     log_level: str = "INFO"
     log_file: str = ""
+    stats_interval: int = 0         # seconds between 'stats:' log lines; 0 = off
+    slow_command_seconds: float = 5.0   # log commands slower than this; 0 = off
 
 
 def load_config(path):
@@ -1325,6 +1566,16 @@ def load_config(path):
             raise SystemExit(f"{path}: [{sec}] {key} must be between {lo} and {hi}")
         return n
 
+    def as_float(sec, key, lo, hi):
+        v = get(sec, key)
+        try:
+            n = float(v)
+        except ValueError:
+            raise SystemExit(f"{path}: [{sec}] {key} must be a number, got {v!r}{hint(v)}")
+        if not lo <= n <= hi:
+            raise SystemExit(f"{path}: [{sec}] {key} must be between {lo} and {hi}")
+        return n
+
     def as_list(v):
         return [x.strip() for x in re.split(r"[,\n]", v) if x.strip()]
 
@@ -1338,6 +1589,12 @@ def load_config(path):
             nets.append(ipaddress.ip_network(n, strict=False))
         except ValueError:
             raise SystemExit(f"{path}: [server] allow_networks: bad network {n!r}")
+    exempt = []
+    for n in as_list(get("auth", "no_throttle_networks")):
+        try:
+            exempt.append(ipaddress.ip_network(n, strict=False))
+        except ValueError:
+            raise SystemExit(f"{path}: [auth] no_throttle_networks: bad network {n!r}")
     level = get("logging", "level").upper()
     if level not in ("DEBUG", "INFO", "WARNING", "ERROR"):
         raise SystemExit(f"{path}: [logging] level must be DEBUG, INFO, WARNING or ERROR, "
@@ -1392,8 +1649,14 @@ def load_config(path):
         verify_on_read=verify_raw in ("true", "yes", "on", "1"),
         cert=cert, key=key, tls_port=tls_port, also_plain=also_plain,
         password_file=rpath(get("auth", "password_file")),
+        login_fail_limit=as_int("auth", "login_fail_limit", 0, 1000),
+        login_fail_window=as_int("auth", "login_fail_window", 1, 86400),
+        login_block_seconds=as_int("auth", "login_block_seconds", 1, 604800),
+        no_throttle_networks=exempt,
         log_level=level,
         log_file=rpath(get("logging", "file")),
+        stats_interval=as_int("logging", "stats_interval", 0, 86400),
+        slow_command_seconds=as_float("logging", "slow_command_seconds", 0, 86400),
     )
 
 
@@ -1450,6 +1713,182 @@ def peer_allowed(cfg, peer):
     return any(ip in n for n in cfg.allow_networks)
 
 
+def listeners_for(cfg):
+    """[(port, uses_tls)] the server opens. Without [tls] port the old behaviour holds: one
+    listener on [server] port, TLS if a certificate is set. With [tls] port, TLS listens there
+    and the unencrypted [server] port is opened only if also_plain = true."""
+    if cfg.tls_port:
+        out = [(cfg.tls_port, True)]
+        if cfg.also_plain:
+            out.append((cfg.port, False))
+        return out
+    return [(cfg.port, bool(cfg.cert))]
+
+
+# ============================================================================
+# Configuration checks: --check-config, and the warnings/failures at startup
+# ============================================================================
+OK, WARN, FAIL = "OK", "WARN", "FAIL"
+CERT_WARN_DAYS = 30
+
+
+def _cert_not_after(path):
+    """Expiry (UTC) of the first certificate in a PEM file, or None when this Python cannot
+    read it. Python's public ssl module has no certificate parser, so this uses a private
+    helper of CPython's ssl module and gives up quietly if it is missing."""
+    try:
+        info = ssl._ssl._test_decode_cert(path)
+        return datetime.fromtimestamp(ssl.cert_time_to_seconds(info["notAfter"]), timezone.utc)
+    except Exception:
+        return None
+
+
+def check_tls(cfg, startup=False, now=None):
+    """Findings [(level, text)] about the listeners and the TLS certificate."""
+    out = []
+    loopback = cfg.host in ("127.0.0.1", "::1", "localhost")
+    for port, tls in listeners_for(cfg):
+        if tls:
+            out.append((OK, f"TLS listener on {cfg.host}:{port}"))
+        elif loopback:
+            out.append((OK, f"plaintext listener on {cfg.host}:{port} (this machine only)"))
+        elif not startup:       # serve() already warns about this at startup
+            out.append((WARN, f"plaintext listener on {cfg.host}:{port}: passwords and mail "
+                              "cross the network in clear text"))
+    if not cfg.cert:
+        return out
+    for label, path in (("certificate", cfg.cert), ("key", cfg.key)):
+        if path and not os.path.isfile(path):
+            out.append((FAIL, f"TLS {label} file not found: {path}"))
+    if any(level == FAIL for level, _ in out):
+        return out
+    try:
+        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cfg.cert, cfg.key or None)
+    except (ssl.SSLError, OSError, ValueError) as e:
+        out.append((FAIL, f"TLS certificate and key cannot be loaded: {e}"))
+        return out
+    not_after = _cert_not_after(cfg.cert)
+    if not_after is None:
+        out.append((OK, "TLS certificate and key load (expiry could not be read on this Python)"))
+        return out
+    days = ((not_after - (now or datetime.now(timezone.utc))).total_seconds()) / 86400
+    when = f"{not_after:%Y-%m-%d}"
+    if days < 0:
+        out.append((WARN, f"TLS certificate EXPIRED on {when}: clients that verify it will refuse to connect"))
+    elif days < CERT_WARN_DAYS:
+        out.append((WARN, f"TLS certificate expires in {int(days)} days (on {when})"))
+    else:
+        out.append((OK, f"TLS certificate and key load; certificate valid until {when}"))
+    return out
+
+
+def check_passwords(cfg):
+    out = []
+    path = cfg.password_file
+    if not os.path.isfile(path):
+        return [(FAIL, f"password file not found: {path} (create entries with --set-password LOGIN)")]
+    try:
+        users = read_passwd(path)
+    except (SystemExit, OSError) as e:
+        return [(FAIL, f"password file cannot be read: {e}")]
+    missing = sorted(n for n in cfg.accounts if n not in users)
+    if missing:
+        out.append((FAIL, "no password set for: " + ", ".join(missing) + " (use --set-password LOGIN)"))
+    else:
+        out.append((OK, f"password file has a valid hash for all {len(cfg.accounts)} account(s)"))
+    for extra in sorted(set(users) - set(cfg.accounts)):
+        out.append((WARN, f"password file has an entry for {extra!r} but there is no [account:{extra}]"))
+    if os.stat(path).st_mode & 0o077:
+        out.append((WARN, f"{path} is readable by other users; run: chmod 600 {path}"))
+    return out
+
+
+def check_accounts(cfg, startup=False):
+    out = []
+    for name, ac in cfg.accounts.items():
+        tag = f"account {name}"
+        try:
+            backend = ArchiveBackend(ac.repo_path, ac.uidvalidity, ac.hide_folders)
+        except SystemExit as e:
+            out.append((FAIL, f"{tag}: {e}"))
+            continue
+        if not os.access(backend.msg_root, os.R_OK | os.X_OK):
+            out.append((FAIL, f"{tag}: cannot read {backend.msg_root}"))
+            continue
+        try:
+            missing = backend.missing_columns()
+            if missing:
+                out.append((FAIL, f"{tag}: the database lacks what this server reads: "
+                                  + ", ".join(missing)))
+                continue
+            with closing(backend._db()) as db:
+                names = [r[0] for r in db.execute("SELECT name FROM folders")]
+                n_msgs = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        except sqlite3.Error as e:
+            out.append((WARN, f"{tag}: the database could not be read just now ({e}); is the "
+                              "importer holding a lock?"))
+            continue
+        if not startup:
+            out.append((OK, f"{tag}: {backend.application}, {len(names)} folder(s), "
+                            f"{n_msgs:,} message(s), UIDVALIDITY {backend.uidvalidity}"))
+        for pat in ac.hide_folders:
+            if not any(fnmatch.fnmatchcase(n, pat) for n in names):
+                out.append((WARN, f"{tag}: hide_folders pattern {pat!r} matches no folder (typo?)"))
+    return out
+
+
+def check_bind(cfg):
+    out = []
+    for port, tls in listeners_for(cfg):
+        try:
+            with socket.create_server((cfg.host, port)):
+                pass
+            out.append((OK, f"can listen on {cfg.host}:{port}"))
+        except OSError as e:
+            out.append((FAIL, f"cannot listen on {cfg.host}:{port}: {e.strerror or e} "
+                              "(already in use, perhaps by the running server?)"))
+    return out
+
+
+def run_check_config(path, strict=False, bind=False, out=print):
+    """--check-config: validate everything without starting the server or touching a repository.
+
+    Exit status: 0 no failures (warnings allowed unless --strict), 1 failures (or warnings with
+    --strict), 2 the configuration file could not be read.
+    """
+    try:
+        cfg = load_config(path)
+    except SystemExit as e:
+        out(f"  {FAIL:<4}  configuration: {e.code}")
+        out("0 checks passed; the configuration could not be read")
+        return 2
+    out(f"  {OK:<4}  configuration {path} is valid: {len(cfg.accounts)} account(s)")
+    findings = check_tls(cfg) + check_passwords(cfg) + check_accounts(cfg)
+    if bind:
+        findings += check_bind(cfg)
+    for level, text in findings:
+        out(f"  {level:<4}  {text}")
+    counts = Counter(level for level, _ in findings)
+    counts[OK] += 1                     # the configuration line above
+    out(f"{sum(counts.values())} checks: {counts[OK]} OK, {counts[WARN]} WARN, {counts[FAIL]} FAIL")
+    if counts[FAIL] or (strict and counts[WARN]):
+        return 1
+    return 0
+
+
+def startup_checks(cfg):
+    """Run at normal startup: warnings are logged, failures stop the server with a clear message.
+    (Passwords are checked by build_accounts, so they are not repeated here.)"""
+    failures = []
+    for level, text in check_tls(cfg, startup=True) + check_accounts(cfg, startup=True):
+        if level == WARN:
+            log.warning("startup check: %s", text)
+        elif level == FAIL:
+            failures.append(text)
+    if failures:
+        raise SystemExit("startup check failed:\n  " + "\n  ".join(failures))
+
+
 async def serve(cfg, accounts):
     auth_gate = asyncio.Semaphore(2)        # at most 2 scrypt computations at once
     dummy_hash = hash_password(os.urandom(16).hex())
@@ -1458,14 +1897,30 @@ async def serve(cfg, accounts):
     # FETCH or SEARCH does not stall the others. Separate from the default executor, which
     # password hashing uses, so a login flood cannot starve readers (or the other way round).
     executor = ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="imapd")
+    stats = Stats()
+    throttle = LoginThrottle(cfg.login_fail_limit, cfg.login_fail_window, cfg.login_block_seconds,
+                             cfg.no_throttle_networks)
 
     async def handle(r, w):
         peer = w.get_extra_info("peername")
+        stats.connections += 1
         if not peer_allowed(cfg, peer[0]):
+            stats.rejected["not_allowed"] += 1
             log.warning("rejected connection from %s (not in allow_networks)", peer[0])
             w.close()
             return
+        if throttle.blocked_for(peer[0]):
+            stats.rejected["throttled"] += 1
+            log.debug("rejected connection from %s (blocked after failed logins)", peer[0])
+            try:
+                w.write(b"* BYE Too many failed logins; try again later\r\n")
+                await asyncio.wait_for(w.drain(), 5)
+            except (ConnectionError, OSError, asyncio.TimeoutError):
+                pass
+            w.close()
+            return
         if cfg.max_connections and len(writers) >= cfg.max_connections:
+            stats.rejected["max_connections"] += 1
             log.warning("rejected connection from %s (max_connections = %d reached)",
                         peer[0], cfg.max_connections)
             try:
@@ -1478,7 +1933,8 @@ async def serve(cfg, accounts):
         log.info("connection from %s", peer)
         writers.add(w)
         try:
-            await Session(r, w, accounts, cfg, auth_gate, dummy_hash, executor).run()
+            await Session(r, w, accounts, cfg, auth_gate, dummy_hash, executor,
+                          stats, throttle).run()
         finally:
             writers.discard(w)
 
@@ -1487,15 +1943,7 @@ async def serve(cfg, accounts):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cfg.cert, cfg.key or None)
 
-    # Listeners as (port, ssl context). Without [tls] port the old behaviour holds: one
-    # listener on [server] port, TLS if a certificate is set. With [tls] port, TLS listens
-    # there and the unencrypted [server] port is opened only if also_plain = true.
-    if cfg.tls_port:
-        listeners = [(cfg.tls_port, ctx)]
-        if cfg.also_plain:
-            listeners.append((cfg.port, None))
-    else:
-        listeners = [(cfg.port, ctx)]
+    listeners = [(port, ctx if tls else None) for port, tls in listeners_for(cfg)]
     servers = []
     for port, lctx in listeners:
         servers.append(await asyncio.start_server(handle, cfg.host, port, ssl=lctx))
@@ -1514,7 +1962,22 @@ async def serve(cfg, accounts):
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:               # e.g. Windows
             pass
+    if hasattr(signal, "SIGUSR1"):                 # `kill -USR1 <pid>` writes the statistics now
+        try:
+            loop.add_signal_handler(signal.SIGUSR1, lambda: log.info(stats.line(len(writers))))
+        except NotImplementedError:
+            pass
+    stats_task = None
+    if cfg.stats_interval:
+        async def stats_loop():
+            while True:
+                await asyncio.sleep(cfg.stats_interval)
+                log.info(stats.line(len(writers)))
+        stats_task = asyncio.ensure_future(stats_loop())
     await stop.wait()
+    if stats_task:
+        stats_task.cancel()
+        log.info(stats.line(len(writers)))         # final figures
     log.info("shutting down (%d open connection(s))", len(writers))
     for server in servers:
         server.close()
@@ -1537,8 +2000,19 @@ def main():
     ap.add_argument("--verify", action="store_true",
                     help="check every message file against its recorded size/SHA-256, then exit")
     ap.add_argument("--account", metavar="LOGIN", help="with --verify: check only this account")
+    ap.add_argument("--check-config", action="store_true",
+                    help="validate the .ini, accounts, repositories, TLS and passwords, then exit "
+                         "(exit 0: no failures, 1: failures, 2: configuration unreadable)")
+    ap.add_argument("--strict", action="store_true", help="with --check-config: warnings fail too")
+    ap.add_argument("--check-bind", action="store_true",
+                    help="with --check-config: also try to open the listening ports (fails if the "
+                         "server is already running on them)")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     args = ap.parse_args()
+    if (args.strict or args.check_bind) and not args.check_config:
+        ap.error("--strict and --check-bind only apply with --check-config")
+    if args.check_config:
+        sys.exit(run_check_config(args.config, args.strict, args.check_bind))
     cfg = load_config(args.config)
     logging.basicConfig(level=logging.DEBUG if args.verbose else getattr(logging, cfg.log_level),
                         filename=cfg.log_file or None,
@@ -1557,6 +2031,7 @@ def main():
             rc |= verify(accounts[n].backend)
         sys.exit(rc)
     accounts = build_accounts(cfg, with_passwords=True)
+    startup_checks(cfg)
     try:
         asyncio.run(serve(cfg, accounts))
     except KeyboardInterrupt:   # Ctrl-C before the signal handlers were installed

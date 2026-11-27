@@ -30,18 +30,24 @@ def free_port():
 class ServerProc:
     """accounts: {login: (repo_path, password, {extra account options})}."""
 
-    def __init__(self, accounts, server_opts=None, tmp=None, log_level="INFO", tls_opts=None):
+    def __init__(self, accounts, server_opts=None, tmp=None, log_level="INFO", tls_opts=None,
+                 auth_opts=None, logging_opts=None):
         self.tmp = tmp or tempfile.mkdtemp(prefix="imapd-test-")
         self.port = free_port()
         self.ini = os.path.join(self.tmp, "srv.ini")
         self.pw = os.path.join(self.tmp, "srv.passwd")
         self.logfile = os.path.join(self.tmp, "srv.log")
-        lines = ["[server]", "host = 127.0.0.1", f"port = {self.port}"]
-        lines += [f"{k} = {v}" for k, v in (server_opts or {}).items()]
+        server = {"host": "127.0.0.1", "port": self.port}
+        server.update(server_opts or {})                 # may override host
+        lines = ["[server]"] + [f"{k} = {v}" for k, v in server.items()]
         if tls_opts:
             lines += ["[tls]"] + [f"{k} = {v}" for k, v in tls_opts.items()]
-        lines += ["[auth]", f"password_file = {self.pw}",
-                  "[logging]", f"level = {log_level}", f"file = {self.logfile}"]
+        auth = {"password_file": self.pw}
+        auth.update(auth_opts or {})
+        logging_ = {"level": log_level, "file": self.logfile}
+        logging_.update(logging_opts or {})
+        lines += ["[auth]"] + [f"{k} = {v}" for k, v in auth.items()]
+        lines += ["[logging]"] + [f"{k} = {v}" for k, v in logging_.items()]
         for login, (path, _pw, extra) in accounts.items():
             lines += [f"[account:{login}]", f"path = {path}"]
             lines += [f"{k} = {v}" for k, v in (extra or {}).items()]

@@ -55,7 +55,7 @@ configuration file.
 ## Requirements
 
 - Python 3.11 or later. The server has been developed with Python 3.12 and run
-  with Python 3.13.
+  with Python 3.13. On an older Python it stops at once with a message saying so.
 - Python built with OpenSSL support, which provides `hashlib.scrypt` for
   password hashing (standard on Raspberry Pi OS).
 - One or more repository directories containing `repository.json`,
@@ -220,8 +220,14 @@ settings inline; the tables below summarise them.
 | | `port` | empty | Dedicated TLS port, e.g. `1993`. Requires `cert`. If empty, TLS (when enabled) uses `[server] port`. |
 | | `also_plain` | `false` | With `[tls] port` set, also open the unencrypted `[server] port`. |
 | `[auth]` | `password_file` | `imap_archive_server.passwd` | Password-hash file. Relative paths are resolved against the `.ini` file. |
+| | `login_fail_limit` | `5` | Failed logins from one IP address that trigger a block (0 to 1000; 0 = no throttling). |
+| | `login_fail_window` | `300` | Seconds over which failed logins are counted (1 to 86400). |
+| | `login_block_seconds` | `600` | How long a blocked address stays blocked (1 to 604800). |
+| | `no_throttle_networks` | empty | Comma-separated CIDR ranges that are never throttled, e.g. your home network. |
 | `[logging]` | `level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
 | | `file` | empty | Write logs to this file instead of the terminal. |
+| | `stats_interval` | `0` | Seconds between `stats:` log lines (0 to 86400; 0 = off). `kill -USR1` writes one on demand. |
+| | `slow_command_seconds` | `5` | Log a warning for commands slower than this (decimals allowed; 0 = never). |
 
 ### Per-account settings
 
@@ -321,7 +327,8 @@ remain valid.
 
 ```text
 imap_archive_server.py [--config PATH] [--set-password LOGIN]
-                       [--verify [--account LOGIN]] [-v]
+                       [--verify [--account LOGIN]]
+                       [--check-config [--strict] [--check-bind]] [-v]
 ```
 
 | Option | Meaning |
@@ -330,10 +337,45 @@ imap_archive_server.py [--config PATH] [--set-password LOGIN]
 | `--set-password LOGIN` | Create or change an account password, then exit. |
 | `--verify` | Check every message file in every configured account, print any problems, then exit. |
 | `--account LOGIN` | With `--verify`, check only this account. |
+| `--check-config` | Check the `.ini`, every account's repository, TLS and passwords, print one line per check, then exit. Starts nothing and writes nothing. |
+| `--strict` | With `--check-config`: warnings count as failures too. |
+| `--check-bind` | With `--check-config`: also try to open the listening ports. This fails if the server is already running on them. |
 | `-v`, `--verbose` | Enable debug logging, overriding `level` in the `.ini`. |
 
 For `--verify`, exit status is 0 if all checked files pass and 1 if any
 problem is found. Configuration and repository errors also exit non-zero.
+
+### Checking the configuration
+
+`--check-config` is the quick way to find a mistake before (re)starting:
+
+```text
+$ ./imap_archive_server.py --check-config --check-bind
+  OK    configuration /home/pi/imap_archive_server.ini is valid: 2 account(s)
+  OK    plaintext listener on 127.0.0.1:1143 (this machine only)
+  OK    password file has a valid hash for all 2 account(s)
+  OK    account gmail: gmail-local-repository, 21 folder(s), 1,749 message(s), UIDVALIDITY 1795291171
+  WARN  account yahoo: hide_folders pattern 'Spam*' matches no folder (typo?)
+  OK    can listen on 127.0.0.1:1143
+6 checks: 5 OK, 1 WARN, 0 FAIL
+```
+
+It checks that the `.ini` is valid; that each repository is a supported one, its
+database has every table and column the server reads and its `messages` folder is
+readable; that `hide_folders` patterns match something; that the password file
+exists, holds a valid hash for every account and is not readable by other users;
+that the TLS certificate and key load together and the certificate is not about
+to expire (a warning within 30 days, or once it has expired); and, with
+`--check-bind`, that the ports can be opened. A plaintext listener on a
+non-loopback address is a warning.
+
+Exit status: **0** no failures (warnings are allowed unless `--strict`), **1** at
+least one failure (or a warning with `--strict`), **2** the `.ini` could not be
+read at all.
+
+The same repository and TLS checks run every time the server starts: failures
+stop it with a clear message (`startup check failed: ...`), warnings are logged as
+`startup check: ...`.
 
 ## Checking archive integrity
 
@@ -575,9 +617,10 @@ mailbox special-use attributes. The server advertises only `IMAP4rev1`.
 The server opens each repository database with `PRAGMA query_only=ON`. It does
 not issue database writes. Passwords are compared in constant time; unknown
 logins perform equivalent hashing work. Failed logins are delayed by about one
-second, and a connection is closed after three failed attempts. There is no
-per-address lockout, so network restrictions and firewall rules are still
-important.
+second, a connection is closed after three failed attempts, and an IP address that
+keeps failing is blocked for a while (see `login_fail_limit`). There is no
+per-account lockout, and a block is per address, so network restrictions and
+firewall rules are still important.
 
 ## Troubleshooting
 
@@ -597,6 +640,9 @@ important.
 | `password file ... malformed password hash` / `expected 'login:hash'` | The password file contains an invalid line or an old plaintext password. Replace it using `--set-password`. |
 | Password change has no effect | The password file is read at startup. Restart the server. |
 | `too many failed login attempts` | The client sent three incorrect logins on one connection. Correct the saved password in the client. |
+| `* BYE Too many failed logins; try again later` | The client's IP address was blocked after repeated failed logins (see `login_fail_limit`). Correct the password; the block ends after `login_block_seconds`, or add the network to `no_throttle_networks`, or restart the server. |
+| `startup check failed: ...` | `--check-config` shows the same checks one line at a time. The message names the account and what is missing (a table or column, a certificate file, ...). |
+| Log: `slow command: ...` | A command took longer than `slow_command_seconds`. Tag, command name and account tell you which; raise the setting if it is noise. |
 | Binding a port fails with a permission error | Ports below 1024 need privileges. Use 1143 or a firewall redirect. |
 | Log: `INTEGRITY MISMATCH` | A message file differs from the recorded size or SHA-256. Run `--verify` and compare with a backup. |
 | Log: `LF-only line endings` | A stored message has LF-only line endings. Some clients may misparse it; the server still serves the original bytes. |
@@ -626,6 +672,40 @@ The server protects itself against clients that stall, misbehave or flood it:
   refused: a normal `{n}` literal gets a tagged `NO [TOOBIG]` and the connection
   carries on; a `{n+}` literal, which the client is already sending, closes it.
   Other connections are never affected.
+- **Over-complex commands.** More than 100 levels of nested parentheses (or of
+  `NOT`/`OR` in a `SEARCH`) or more than 10,000 items in one command get a
+  `BAD` reply (`parentheses nested too deeply`, `command too complex`). Ordinary
+  clients never come near these limits. Message sets such as
+  `UID FETCH 5,9,12,...` can be as long as the 64 KiB command line allows; they
+  are matched efficiently, so a long set no longer slows the server down.
+- **Failed-login throttling.** An IP address that makes `login_fail_limit` failed
+  logins within `login_fail_window` seconds is blocked for `login_block_seconds`:
+  its connections are answered `* BYE Too many failed logins; try again later`
+  and no password is checked. A successful login clears the count; addresses in
+  `no_throttle_networks` are never blocked. The counts are kept in memory only
+  (a restart clears them), per address and not per account, so nobody can lock
+  you out of your own account by guessing at its name. Many users behind one
+  shared (NAT) address share one count.
+
+### Seeing what happens: statistics and slow commands
+
+Set `stats_interval = 3600` (or any number of seconds) in `[logging]` and the log
+gets a line like this every hour, and one more at shutdown:
+
+```text
+stats: uptime=3600s connections=48 open=3 rejected=throttled:2 logins_ok=40 logins_failed=3 logins_throttled=1 commands=EXAMINE:12,FETCH:310,LIST:40,LOGIN:43,NOOP:25,UID_FETCH:90,UID_SEARCH:7 slow_commands=1 bytes_sent=91827364 errors=-
+```
+
+`kill -USR1 <pid>` writes the same line immediately (on systems that have
+`SIGUSR1`), even when `stats_interval` is 0. The command counts show what your
+mail clients and web client actually send, which is the best guide to which
+protocol features matter. The line has counts and command names only; it never
+contains arguments, folder names, account names or message content.
+
+A command that takes longer than `slow_command_seconds` (default 5) is logged as a
+warning, for example `slow command: t7 UID SEARCH took 8.2 s (account me, peer
+192.168.1.20)`. The time includes sending the reply, so a client on a slow link
+counts too. Set it to 0 to switch this off.
 
 ### One busy client does not slow the others
 
@@ -689,7 +769,7 @@ server as a subprocess and talks to it over real sockets. Nothing outside the
 temporary directory is touched.
 
 ```bash
-python3 -m unittest discover -s tests -v     # about 30-45 seconds
+python3 -m unittest discover -s tests -v     # about 2 minutes
 python3 -m unittest tests.test_server.ProtocolTests    # one group only
 ```
 
@@ -697,7 +777,11 @@ The suite covers the read-only protocol (LIST, STATUS, SELECT, FETCH sections,
 SEARCH keys, refusals), authentication, account isolation, timeouts and limits,
 oversized or garbage input, damaged archives (`--verify`, `INTEGRITY MISMATCH`),
 implicit TLS, clean shutdown, and responsiveness of other clients while one
-client runs a heavy FETCH or SEARCH.
+client runs a heavy FETCH or SEARCH. It also covers the `stats:` counters and
+slow-command log, the parser limits, failed-login throttling and `--check-config`
+(and the startup checks). The login-throttling tests take a few seconds each
+because every failed login is delayed by one second; the whole suite takes about
+two minutes.
 
 To check that a change did not alter any reply, compare the new script with an
 earlier copy. Both servers receive the same ~130 commands and every difference
