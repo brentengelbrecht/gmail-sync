@@ -29,11 +29,13 @@ repository code. No App Password or IMAP authentication is used.
     part of the MIME message.
 -   Stores each Gmail message once, even when it has multiple Gmail
     labels.
--   Records Gmail labels separately from local folder memberships.
-    Initial label memberships are copied locally; later Gmail label
-    changes do not reorganise existing local folders.
--   Does not delete local messages or local folder memberships when
-    Gmail messages or labels disappear remotely.
+-   Records Gmail labels separately from local folder memberships. Initial
+    label memberships are copied locally; later Gmail label changes update
+    memberships in mapped local folders for messages already stored.
+    Memberships in local-only folders are preserved.
+-   Does not delete local messages when they disappear from Gmail. When a
+    Gmail label is removed, its mapped local-folder membership is removed;
+    memberships in local-only folders and `ALL EMAIL` are preserved.
 -   Provides the `delete_local_message()` module function for explicit
     local deletion: it removes the message file, canonical database record
     and folder memberships, and records a tombstone to prevent later
@@ -401,8 +403,11 @@ DB_LOCATION/<URL-encoded-email-address>/
     import, labels are mapped to local folders; newly imported messages
     on later runs are also placed in folders for labels that already have
     a local-folder mapping. For messages already stored locally, later
-    Gmail label changes refresh the source-side label snapshot only and
-    do not add or remove local folder memberships.
+    Gmail label changes refresh the source-side label snapshot and
+    synchronise memberships in Gmail-label-mapped local folders. A mapped
+    folder membership is added or removed to reflect the message's current
+    Gmail labels. Memberships in local-only folders are left untouched,
+    and `ALL EMAIL` membership is always preserved.
 -   Gmail deletions and label removals do not delete local files or
     remove `ALL EMAIL` membership.
 -   Only explicit local deletion removes a message from the repository;
@@ -423,8 +428,9 @@ The local folder model is deliberately ordinary and explicit:
 -   `INBOX` and other folders are subsets/references into the same
     canonical messages and `.eml` files. Archiving or removing a message
     from `INBOX` must not remove it from `ALL EMAIL`.
--   Gmail label changes update Gmail-source label metadata; they do not
-    reorganise existing local folder memberships.
+-   Gmail label changes update Gmail-source label metadata and synchronise
+    memberships in mapped local folders. Local-only folder memberships
+    are preserved.
 -   Remote Gmail deletion does not remove local messages or their
     `ALL EMAIL` membership.
 -   Explicit local deletion removes the message and all its folder
@@ -468,8 +474,11 @@ disk-space safeguards.
 Normal imports perform a complete Gmail `messages.list` scan on every run.
 The importer does not use the Gmail History API and does not persist a
 history checkpoint. Existing messages are fetched in metadata format to
-refresh their Gmail label snapshot; raw message content is downloaded only
-for messages not already stored locally.
+refresh their Gmail label snapshot and synchronise mapped local folder
+memberships; raw message content is downloaded only for messages not
+already stored locally. Gmail-label-mapped folders are reconciled against
+the current labels, while memberships in local-only folders are preserved.
+The `ALL EMAIL` membership is never removed by label synchronisation.
 
 The source file contains a `delete_local_message()` function for use by a
 local mail-store integration. The importer command-line interface itself

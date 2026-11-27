@@ -13,8 +13,8 @@ Repository ownership model:
 - Local folders and Gmail labels are organisational references to
   canonical message records, never separate physical message copies.
 - Archiving removes INBOX membership, not ALL EMAIL membership.
-- Gmail label changes never reorganise existing local folders or remove
-  ALL EMAIL membership.
+- Gmail label changes update memberships in local folders mapped to Gmail
+  labels. They never remove ALL EMAIL membership.
 - Gmail deletions never delete local data.
 - Only explicit local deletion removes a message and all its folder memberships.
 - Locally deleted Gmail messages are suppressed by a tombstone.
@@ -384,10 +384,10 @@ Import behaviour:
     is downloaded only for newly imported messages.
   - Every active message has a relationship to the normal persisted
     ALL EMAIL folder.
-  - Gmail deletions and label removals do not delete local messages or
-    remove their ALL EMAIL membership.
-  - Gmail label changes update source metadata without reorganising
-    existing local folder memberships.
+  - Gmail deletions never delete local messages or remove their ALL EMAIL
+    membership.
+  - Gmail label changes synchronise memberships in mapped local folders.
+  - Local-only folder memberships are not changed by Gmail label updates.
   - Local deletion removes the message and its folder memberships,
     including ALL EMAIL, and creates a tombstone to suppress re-import.
 """,
@@ -1228,6 +1228,72 @@ def refresh_source_labels(connection: sqlite3.Connection, message_id: int,
             )
 
 
+def sync_gmail_label_folder_memberships(
+    connection: sqlite3.Connection,
+    message_id: int,
+    label_ids: list[str],
+    label_mapping: dict[str, Optional[int]],
+    all_email_folder_id: int,
+    now: str,
+) -> None:
+    """Synchronise mapped local folder memberships with current Gmail labels.
+
+    Only folders mapped to Gmail labels are managed here. Local-only folders
+    are left untouched. ALL EMAIL is explicitly protected and always retained.
+    """
+    desired_folder_ids = {
+        label_mapping[label_id]
+        for label_id in label_ids
+        if label_mapping.get(label_id) is not None
+    }
+
+    # ALL EMAIL is permanent ownership, not a removable Gmail-label membership.
+    desired_folder_ids.discard(all_email_folder_id)
+
+    # These are the folders whose memberships are managed by Gmail labels.
+    managed_folder_ids = {
+        int(row["local_folder_id"])
+        for row in connection.execute(
+            """
+            SELECT DISTINCT local_folder_id
+            FROM gmail_labels
+            WHERE local_folder_id IS NOT NULL
+            """
+        )
+    }
+
+    managed_folder_ids.discard(all_email_folder_id)
+
+    for folder_id in managed_folder_ids:
+        if folder_id in desired_folder_ids:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO folder_messages(
+                    folder_id, message_id, gmail_uid, first_seen_at
+                ) VALUES (?, ?, NULL, ?)
+                """,
+                (folder_id, message_id, now),
+            )
+        else:
+            connection.execute(
+                """
+                DELETE FROM folder_messages
+                WHERE folder_id = ? AND message_id = ?
+                """,
+                (folder_id, message_id),
+            )
+
+    # Repair missing ALL EMAIL membership without disturbing other folders.
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO folder_messages(
+            folder_id, message_id, gmail_uid, first_seen_at
+        ) VALUES (?, ?, NULL, ?)
+        """,
+        (all_email_folder_id, message_id, now),
+    )
+
+
 def import_one_message(connection: sqlite3.Connection, repository_path: Path,
                         message: dict, label_mapping: dict[str, Optional[int]],
                         mode: str, all_email_folder_id: int) -> bool:
@@ -1379,7 +1445,7 @@ def process_changed_message(connection: sqlite3.Connection, service,
                              repository_path: Path, gm_id: str,
                              label_mapping: dict[str, Optional[int]], mode: str,
                              all_email_folder_id: int) -> bool:
-    """Refresh one changed Gmail message without changing existing local folders."""
+    """Refresh a changed message and synchronise its Gmail-mapped folders."""
     if connection.execute(
         "SELECT 1 FROM deleted_messages WHERE gm_id = ?", (gm_id,)
     ).fetchone():
@@ -1398,14 +1464,29 @@ def process_changed_message(connection: sqlite3.Connection, service,
         raise
 
     labels = set(metadata.get("label_ids", []))
+
     if existing:
-        # Keep the local copy regardless of remote Spam/Trash placement, but
-        # accurately refresh the source-side Gmail label snapshot.
+        # Keep the canonical local message regardless of remote Spam/Trash
+        # placement. Refresh its source labels and synchronise its Gmail-mapped
+        # local folder memberships.
         now = datetime.now(timezone.utc).isoformat()
+        message_id = int(existing["message_id"])
+        label_ids = list(dict.fromkeys(metadata.get("label_ids", [])))
+
         with transaction(connection):
             refresh_source_labels(
-                connection, int(existing["message_id"]),
-                metadata.get("label_ids", []), now,
+                connection,
+                message_id,
+                label_ids,
+                now,
+            )
+            sync_gmail_label_folder_memberships(
+                connection,
+                message_id,
+                label_ids,
+                label_mapping,
+                all_email_folder_id,
+                now,
             )
         return False
 
@@ -1421,8 +1502,13 @@ def process_changed_message(connection: sqlite3.Connection, service,
         if is_gmail_not_found(exc):
             return False
         raise
+
     return import_one_message(
-        connection, repository_path, message, label_mapping, mode,
+        connection,
+        repository_path,
+        message,
+        label_mapping,
+        mode,
         all_email_folder_id,
     )
 
